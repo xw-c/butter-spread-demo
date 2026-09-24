@@ -1,0 +1,45 @@
+{
+  "upstream": "https://github.com/penn-graphics-research/ziran2019/blob/master/Data/LevelSets/breadxxx.vdb.zip",
+  "license": "MIT, Copyright (c) 2020 Penn Graphics Research",
+  "asset_use": "reference VDB surface only; no CD-MPM fracture simulation is run",
+  "lods": [
+    {
+      "name": "hero",
+      "voxel_amount": 512,
+      "vertices": 1098355,
+      "triangles": 2086606,
+      "bounds": [
+        [
+          3.1341464519500732,
+          3.5008153915405273,
+          3.4007270336151123
+        ],
+        [
+          3.8695733547210693,
+          3.860715627670288,
+          3.600703001022339
+        ]
+      ],
+      "sha256": "6d6d1e694f5824ac36ad296ef9308b8e161bb0999920d3a176934fa6523d8a08"
+    },
+    {
+      "name": "background",
+      "voxel_amount": 240,
+      "vertices": 277293,
+      "triangles": 543942,
+      "bounds": [
+        [
+          3.1362154483795166,
+          3.5018322467803955,
+          3.4014651775360107
+        ],
+        [
+          3.869896411895752,
+          3.860600233078003,
+          3.6014621257781982
+        ]
+      ],
+      "sha256": "779a7300e27eb2294349eacf133489c96fd350d79affd6ea06ba634f8e81f28d"
+    }
+  ]
+}

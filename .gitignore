@@ -1,0 +1,16 @@
+# Generated simulation and render outputs
+/outputs/
+/.vendor/
+
+# Large intermediate mesh products; rebuild from the bundled source VDB archive
+/assets/reference/cdmpm/breadxxx.vdb
+/assets/cdmpm-bread-raw.npz
+/assets/cdmpm-bread-hero*.npz
+/assets/cdmpm-bread-background*.npz
+
+# Python and Blender caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.blend1
+*.log
