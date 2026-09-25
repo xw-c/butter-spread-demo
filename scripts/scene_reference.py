@@ -121,7 +121,7 @@ def tub(stage,base,center,angle,white,blue,label,butter):
                 k=a*12+b;faces.append((k,k+12,k+13,k+1))
         smooth_mesh(stage,f'{base}/ButterCurl{i}',points,faces,butter)
 
-def make_scene_assets(stage,asset_root:Path,initial_knife_pose):
+def make_scene_assets(stage,asset_root:Path,initial_knife_pose,knife_thickness=.012):
     tex=asset_root/'textures'
     table=_textured_material(stage,'Stone',tex/'stone-gray.png',(.2,.2,.2),.72)
     normal_texture(stage,table,tex/'stone-normal.png')
@@ -175,4 +175,5 @@ def make_scene_assets(stage,asset_root:Path,initial_knife_pose):
     knife_shader.GetInput('diffuseColor').Set(Gf.Vec3f(.6,.62,.65))
     knife_shader.GetInput('metallic').Set(1.0)
     normal_texture(stage,knife_steel,tex/'knife-brushed-normal.png')
-    return add_knife(stage, '/World/Task/Knife', knife_steel, initial_knife_pose)
+    return add_knife(stage, '/World/Task/Knife', knife_steel, initial_knife_pose,
+                     collider_thickness=knife_thickness)

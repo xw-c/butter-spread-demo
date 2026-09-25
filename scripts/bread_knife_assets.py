@@ -11,7 +11,7 @@ ROOT=Path(__file__).resolve().parents[1]
 def crumb_material(stage):
     mat=_material(stage,'CDMPM_Crumb',(.70,.66,.56),.91)
     shader=UsdShade.Shader.Define(stage,'/World/Looks/CDMPM_Crumb/Scattering')
-    mdl=ROOT.parent/'lw-runtime/Lib/site-packages/omni/mdl/core/Base/OmniSurface.mdl'
+    mdl=ROOT.parent/'lw-runtime/Lib/site-packages/isaacsim/kit/mdl/core/Base/OmniSurface.mdl'
     shader.CreateImplementationSourceAttr().Set(UsdShade.Tokens.sourceAsset)
     shader.SetSourceAsset(Sdf.AssetPath(str(mdl)),'mdl')
     shader.SetSourceAssetSubIdentifier('OmniSurface','mdl')
@@ -124,7 +124,7 @@ def _solid_flat_profile(stage,path,outline,thickness,bevel,material):
     mesh.SetNormalsInterpolation('vertex')
     return mesh
 
-def add_knife(stage,path,steel,initial_pos):
+def add_knife(stage,path,steel,initial_pos,collider_thickness=.012):
     root=UsdGeom.Xform.Define(stage,path)
     blade=_smooth_outline([(-.0068,-.034),(-.0078,.012),(-.0072,.037),
         (-.0053,.047),(-.001,.051),(.005,.049),(.010,.041),(.012,.023),
@@ -134,10 +134,10 @@ def add_knife(stage,path,steel,initial_pos):
         (-.0083,-.130),(-.0076,-.145),(-.003,-.151),(.0035,-.151),
         (.008,-.145),(.0088,-.129),(.006,-.077),(.0038,-.055),(.003,-.036)],8)
     _solid_flat_profile(stage,path+'/RoundedHandle',handle,.0036,.0025,steel)
-    # Retain the existing physical trajectory and align the blade's lower face
-    # to its thicker MPM collision proxy. Proxy limitations are documented.
+    # Keep the original trajectory, aligning the visible lower face to the
+    # calibrated MPM proxy's lower face for each saved physics state.
     move=root.AddTranslateOp()
     def set_pose(pos):
-        x,y,z=map(float,pos);move.Set(Gf.Vec3d(x,y,z-.0054))
+        x,y,z=map(float,pos);move.Set(Gf.Vec3d(x,y,z+.0006-collider_thickness/2))
     set_pose(initial_pos)
     return set_pose

@@ -1,7 +1,7 @@
-"""Render Genesis MPM state in Isaac Sim as a three-second close-up video."""
+"""Render recorded Genesis MPM state in the Isaac Sim scene."""
 import argparse
+import hashlib
 import json
-import os
 from pathlib import Path
 
 import numpy as np
@@ -16,7 +16,7 @@ parser.add_argument("--height", type=int, default=720)
 parser.add_argument("--frames", type=int, default=0, help="0 renders all frames")
 parser.add_argument("--gui", action="store_true")
 parser.add_argument("--start-frame", type=int, default=0)
-parser.add_argument("--samples", type=int, default=32)
+parser.add_argument("--samples", type=int, default=64)
 parser.add_argument("--renderer", choices=('PathTracing', 'RaytracedLighting'), default='PathTracing')
 parser.add_argument('--camera', choices=('scene','bread'), default='scene')
 parser.add_argument('--stage-format', choices=('usda','usdc'), default='usdc')
@@ -24,6 +24,11 @@ parser.add_argument('--skip-stage', action='store_true')
 args = parser.parse_args()
 data = np.load(args.state)
 surface = np.load(args.surface)
+surface_vertices, surface_faces = surface['vertices'], surface['faces']
+surface_normals = surface['normals'] if 'normals' in surface.files else None
+vertex_offsets, face_offsets = surface['vertex_offsets'], surface['face_offsets']
+source_hashes = {"state": hashlib.sha256(args.state.read_bytes()).hexdigest(),
+                 "surface": hashlib.sha256(args.surface.read_bytes()).hexdigest()}
 particles = data["particles"]
 knife_positions = data["knife_positions"]
 if len(surface["vertex_offsets"]) != len(particles) + 1:
@@ -34,7 +39,6 @@ if not 0 <= args.start_frame < len(particles):
 count = min(count, len(particles) - args.start_frame)
 args.output.parent.mkdir(parents=True, exist_ok=True)
 
-os.environ.setdefault("OMNI_KIT_ACCEPT_EULA", "YES")
 from isaacsim import SimulationApp
 app = SimulationApp({"headless": not args.gui, "width": args.width,
                      "height": args.height, "anti_aliasing": 3,
@@ -79,7 +83,8 @@ try:
         UsdShade.MaterialBindingAPI.Apply(prim).Bind(mats[name])
 
     set_knife_pose = make_scene_assets(
-        stage, ROOT / "assets", knife_positions[0])
+        stage, ROOT / "assets", knife_positions[0],
+        knife_thickness=float(data["knife_size"][2]))
 
     butter = UsdGeom.Mesh.Define(stage, "/World/Task/Butter/Surface")
     butter.CreateSubdivisionSchemeAttr("none")
@@ -141,36 +146,49 @@ try:
         codec="libx264", pix_fmt_in="rgb24", pix_fmt_out="yuv420p",
         quality=8, macro_block_size=1)
     writer.send(None)
-    snapshots = {args.start_frame, min(args.start_frame+count-1, args.start_frame+36), args.start_frame+count-1}
+    snapshots = {args.start_frame, args.start_frame + (count - 1) // 2, args.start_frame + count - 1}
     for i in range(args.start_frame, args.start_frame + count):
         pos = knife_positions[i]
         set_knife_pose(pos)
-        v0, v1 = surface["vertex_offsets"][i:i + 2]
-        f0, f1 = surface["face_offsets"][i:i + 2]
-        verts = surface["vertices"][v0:v1]
-        faces = surface["faces"][f0:f1]
+        v0, v1 = vertex_offsets[i:i + 2]
+        f0, f1 = face_offsets[i:i + 2]
+        verts = surface_vertices[v0:v1]
+        faces = surface_faces[f0:f1]
         butter.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(verts.astype(np.float32)))
         butter.GetFaceVertexCountsAttr().Set(Vt.IntArray.FromNumpy(
             np.full(len(faces), 3, dtype=np.int32)))
         butter.GetFaceVertexIndicesAttr().Set(Vt.IntArray.FromNumpy(faces.ravel()))
-        normals=np.zeros_like(verts)
-        face_normals=np.cross(verts[faces[:,1]]-verts[faces[:,0]],verts[faces[:,2]]-verts[faces[:,0]])
-        for corner in range(3): np.add.at(normals,faces[:,corner],face_normals)
-        normals/=np.maximum(np.linalg.norm(normals,axis=1,keepdims=True),1e-10)
+        if surface_normals is not None:
+            normals = surface_normals[v0:v1]
+        else:
+            # Retained only for comparison with previously saved surfaces.
+            normals=np.zeros_like(verts)
+            face_normals=np.cross(verts[faces[:,1]]-verts[faces[:,0]],verts[faces[:,2]]-verts[faces[:,0]])
+            for corner in range(3): np.add.at(normals,faces[:,corner],face_normals)
+            normals/=np.maximum(np.linalg.norm(normals,axis=1,keepdims=True),1e-10)
         butter.CreateNormalsAttr(Vt.Vec3fArray.FromNumpy(normals.astype(np.float32)))
         butter.SetNormalsInterpolation('vertex')
         # Replicator flushes the USD updates and waits for the requested SPP.
         # A separate app.update() would render the same state again.
-        rep.orchestrator.step(rt_subframes=2 if i == args.start_frame else 1)
-        if args.renderer == 'PathTracing' and settings.get('/rtx/pathtracing/totalSpp') != args.samples:
-            raise RuntimeError('Isaac changed the requested path-tracing sample count during capture')
-        pixels = np.asarray(rgb.get_data())
-        if pixels.shape[:2] != (args.height, args.width):
-            raise RuntimeError(f"Unexpected Isaac image shape {pixels.shape}")
+        for attempt in range(4):
+            # On this Isaac/RTX build the RGB annotator intermittently returns
+            # an uninitialized all-black buffer. Render the same USD state
+            # again instead of encoding that buffer as a video frame.
+            rep.orchestrator.step(rt_subframes=2)
+            if args.renderer == 'PathTracing' and settings.get('/rtx/pathtracing/totalSpp') != args.samples:
+                raise RuntimeError('Isaac changed the requested path-tracing sample count during capture')
+            pixels = np.asarray(rgb.get_data())
+            if pixels.shape[:2] != (args.height, args.width):
+                raise RuntimeError(f"Unexpected Isaac image shape {pixels.shape}")
+            if np.any(pixels[:, :, :3]):
+                break
+            print(f"RTX returned an empty buffer for frame {i}; retry {attempt+1}/4", flush=True)
+        else:
+            raise RuntimeError(f"Isaac repeatedly returned a black image for source frame {i}")
         image = Image.fromarray(pixels[:, :, :3].copy())
         writer.send(np.asarray(image).tobytes())
         if i in snapshots:
-            image.save(args.output.with_name(f"frame-{i:03d}.png"))
+            image.save(args.output.with_name(f"{args.output.stem}-frame-{i:03d}.png"))
         if i % 6 == 0:
             print(f"Rendered source frame {i} ({i-args.start_frame+1}/{count})", flush=True)
     writer.close()
@@ -186,6 +204,8 @@ try:
     }
     args.output.with_suffix(".json").write_text(json.dumps({
         "source": str(args.state), "video": str(args.output),
+        "surface_source": str(args.surface), "source_sha256": source_hashes,
+        "normal_method": str(surface['normal_method']) if 'normal_method' in surface.files else 'triangle_average',
         "frames": count, "fps": int(data["fps"]),
         "start_frame": args.start_frame,
         "physics": "Genesis MPM", "renderer": 'Isaac Sim RTX ' + args.renderer,

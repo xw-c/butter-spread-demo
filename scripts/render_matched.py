@@ -6,7 +6,6 @@ layers provide the scene appearance. See README for this visual approximation.
 """
 import argparse
 import json
-import os
 from pathlib import Path
 
 import numpy as np
@@ -53,7 +52,6 @@ def photo_xy(x,y):
 def world_xy(px,py):
     return (px-W/2)*SCALE,(H/2-py)*SCALE
 
-os.environ.setdefault("OMNI_KIT_ACCEPT_EULA", "YES")
 from isaacsim import SimulationApp
 app = SimulationApp({"headless": not args.gui, "width": args.width,
                      "height": args.height, "anti_aliasing": 3})
