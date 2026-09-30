@@ -2,7 +2,7 @@
 
 最新三维资产版为 **scene-v3**：采用 CD-MPM 开源的多孔面包几何，重建薄片圆头餐刀，并移除手模型。物理状态由 `run-demo.ps1 -PhysicsOnly` 生成；本工作区已在 `../lw-runtime` 安装 Isaac Sim 5.1 并预处理 CD-MPM 面包网格，可用 `run-demo.ps1 -ReusePhysics` 渲染该三维场景。来源和物理/视觉边界见 [SCENE-V3.zh-CN.md](SCENE-V3.zh-CN.md)。
 
-本轮涂层修正视频为 `outputs/butter-spread-contact-v7.mp4`，末段近景为 `outputs/butter-spread-contact-v7-closeup.mp4`；默认输出同步更新。具体原因、改动、测量结果和仍存在的小幅表面起伏见 [DEBUG-COATING.zh-CN.md](DEBUG-COATING.zh-CN.md)。
+当前面包变形版视频为 `outputs/butter-spread-deformable-bread-v8.mp4`；默认输出同步更新。上一轮黄油涂层修正视频保留为 `outputs/butter-spread-contact-v7.mp4`。涂层排查记录见 [DEBUG-COATING.zh-CN.md](DEBUG-COATING.zh-CN.md)。
 
 目标是复现[参考视频](https://www.youtube.com/watch?v=KC-QHA_xxEY)的 16–19 秒。用户提供了其中一帧截图，位于 `assets/reference/16-19s-user-frame.png`。当前工作以该帧为场景依据：灰色台面、两只深蓝波纹盘、左侧叠放的吐司、黑色糖碗、右上打开的黄油盒、手扶住的操作面包和银色抹刀。
 
@@ -32,8 +32,10 @@ $env:OMNI_KIT_ACCEPT_EULA = 'YES'
 
 `scripts/prepare_surface.py` 调用连续质量密度重建：各粒子以真实参考体积加权，使用固定 B 样条核和固定半密度等值面。光照法线取自同一密度场的梯度，避免每帧三角形划分变化干扰光照。没有逐帧归一化、连通域删除、粒子删除、时间滤波或额外涂层。上一版固定连接初始材料边界的方法已撤下，因为它可能跨过实际稀疏区。`physics-audit.json` 检查完整粒子轨迹；视频验证额外检查表面连通数、孔洞、体积变化、黑帧、刀片穿透和沉积区域的法向位移，并以文件哈希确保视频、表面、物理状态及审计属于同一轮运行。真实粒子仍有小幅残余松弛，代码没有冻结它们。
 
+操作面包继续使用 Genesis 原版相同的 `PorousBread` 本构及全部参数。`scripts/bread_deformation.py` 将约 302 万个外观顶点绑定到初始规则 MPM 粒子晶格，以固定材料坐标的三线性位移插值驱动全部孔隙表面；边界半个粒子单元作线性外推，位移倍率为 1。法线使用位移映射的逆转置更新，UV、孔隙拓扑和面包材质分区不变。绑定在 `/World/Task` 坐标中计算，与刀具、黄油共用场景旋转。操作面包解除共享实例，仅覆盖自身的顶点、法线和包围盒，背景面包不受影响。`scripts/check_bread_deformation.py` 检查刚体运动、压缩/剪切、边界、法线及 Genesis 参数一致性；渲染报告记录每帧网格变形和 USD 回读检查。该网格是宏观 MPM 软体的外观，不将每个可见孔隙作为独立物理空腔求解。
+
 `scripts/render_matched.py` 在 Isaac Sim 中使用摄影材质平面重建所给截图的镜头布局。`assets/matched/clean-scene.png` 是在截图上去掉旧刀具与面包表面旧黄油后的摄影底图；`buttered-scene.png` 保留参考画面的黄油涂层；`butter-knife.png` 是透明背景的银色抹刀。三张图由 imagegen 对用户截图局部编辑或提取，均已保存到项目。编辑要求分别为：保留其他场景对象并移除旧刀；只移除操作面包上的旧黄油；只提取带黄油残留的银色抹刀。
 
 照片黄油涂层按 Genesis 保存的刀具位置和 MPM 粒子铺展范围逐帧显现，因此画面与给定截图更接近。**照片涂层是外观近似，不是直接由 MPM 粒子网格渲染的物理厚度场。** `scripts/render_isaac.py` 可显示直接由粒子重建的三维表面，便于区分物理求解结果和高保真画面。摄影底图意味着糖碗、黄油盒、盘子、叠放吐司和扶面包的手保持静止；相机也是固定的。
 
-物理部分使用 conda 环境 `genesis-world` 及同工作区的 `genesis-world` 源码；渲染使用独立的 `../lw-runtime` Isaac Sim 5.1 环境。原场景视频 `outputs/butter-spread.mp4` 默认按 1280 × 720、24 fps、97 帧、64 samples 渲染；完整验证结果记录在 `outputs/video-validation.json`。摄影投影渲染沿用原有照片涂层显示逻辑，不能作为黄油几何形状的物理验证；应查看三维场景视频及 `mpm-state.npz`、`mpm-surface.npz`。物理面包会变形，但现有三维场景的 CD-MPM 外观网格保持静态。当前文件夹内也没有机械臂关节/控制器，只有给刀具规定的位姿轨迹。
+物理部分使用 conda 环境 `genesis-world` 及同工作区的 `genesis-world` 源码；渲染使用独立的 `../lw-runtime` Isaac Sim 5.1 环境。原场景视频 `outputs/butter-spread.mp4` 默认按 1280 × 720、24 fps、97 帧、64 samples 渲染；完整验证结果记录在 `outputs/video-validation.json`。摄影投影渲染沿用原有照片涂层显示逻辑，不能作为黄油几何形状的物理验证；应查看三维场景视频及 `mpm-state.npz`、`mpm-surface.npz`。操作面包的 CD-MPM 外观网格现已随 MPM 粒子逐帧变形；背景叠放的面包保持静态。当前文件夹内也没有机械臂关节/控制器，只有给刀具规定的位姿轨迹。

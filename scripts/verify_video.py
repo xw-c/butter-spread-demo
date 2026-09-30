@@ -50,6 +50,8 @@ actual_source_hashes = {'state': hashlib.sha256(args.state.read_bytes()).hexdige
 physics_audit = json.loads(args.physics_audit.read_text(encoding='utf-8'))
 ripples = json.loads(args.ripples.read_text(encoding='utf-8'))
 scene_audit=render_meta.get('scene_audit')
+bread_deformation=render_meta.get('bread_deformation', {})
+bread_frames=bread_deformation.get('frames', [])
 reader = imageio_ffmpeg.read_frames(str(args.video), pix_fmt="rgb24")
 meta = next(reader)
 width, height = meta["size"]
@@ -72,6 +74,15 @@ for i, frame in enumerate(reader):
 checks = {
     "physics_audit_matches_state": (physics_audit.get('pass') is True
                                      and physics_audit.get('state_sha256') == actual_source_hashes['state']),
+    "bread_mesh_follows_mpm": (bread_deformation.get('method') == 'reference_trilinear_mpm_displacement'
+                                and bread_deformation.get('displacement_gain') == 1.0
+                                and bread_deformation.get('source_particle_count') == physics_meta['bread_particle_count']
+                                and len(bread_frames) == len(particle_positions)
+                                and [f['source_frame'] for f in bread_frames] == list(range(len(particle_positions)))
+                                and max((f['max_vertex_displacement_m'] for f in bread_frames), default=0) > 1e-5),
+    "bread_deformation_has_no_foldovers": bool(bread_frames and min(
+        f['minimum_deformation_jacobian'] for f in bread_frames) > 0),
+    "bread_usd_points_match_deformation": bread_deformation.get('usd_readback_max_error_m', 1) < 1e-7,
     "surface_matches_state": ('state_sha256' in surface.files
                               and str(surface['state_sha256']) == actual_source_hashes['state']),
     "density_field_normals_are_used": (render_meta.get('normal_method') == 'density_gradient'
@@ -111,6 +122,9 @@ if scene_audit:
                    'no_hand_model':scene_audit['no_hand_model'],
                    'volumetric_bread_asset':scene_audit['cdmpm_bread_vertices']>1000000,
                    'flat_blade_present':scene_audit['flat_blade_present']})
+    checks['other_bread_slices_unchanged'] = bool(scene_audit.get('bread_library_unchanged')
+        and scene_audit.get('background_bread_remains_instanced')
+        and scene_audit.get('task_bread_is_independently_deformable'))
 artifacts = (args.state,args.surface,args.video,args.physics_audit,args.ripples)
 report = {"pass": all(checks.values()), "checks": checks,
           "decoded_frames": count, "size": [width, height], "fps": meta["fps"],

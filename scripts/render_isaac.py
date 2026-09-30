@@ -30,6 +30,7 @@ vertex_offsets, face_offsets = surface['vertex_offsets'], surface['face_offsets'
 source_hashes = {"state": hashlib.sha256(args.state.read_bytes()).hexdigest(),
                  "surface": hashlib.sha256(args.surface.read_bytes()).hexdigest()}
 particles = data["particles"]
+bread_particles = data['bread_particles']
 knife_positions = data["knife_positions"]
 if len(surface["vertex_offsets"]) != len(particles) + 1:
     raise ValueError("Surface/state frame counts differ; rebuild the surface from this state")
@@ -85,6 +86,26 @@ try:
     set_knife_pose = make_scene_assets(
         stage, ROOT / "assets", knife_positions[0],
         knife_thickness=float(data["knife_size"][2]))
+
+    # Override only the task slice. Editing the shared library would deform
+    # all four background slices as well, and instance proxies are read-only.
+    from bread_deformation import BreadDeformation
+    bread_root = stage.GetPrimAtPath('/World/Task/Bread')
+    bread_root.SetInstanceable(False)
+    bread_mesh = UsdGeom.Mesh.Get(stage, '/World/Task/Bread/Mesh')
+    bread_rest_local = np.asarray(bread_mesh.GetPointsAttr().Get(), dtype=np.float32).copy()
+    bread_rest_normals = np.asarray(bread_mesh.GetNormalsAttr().Get(), dtype=np.float32).copy()
+    transform_cache = UsdGeom.XformCache()
+    relative_transform = np.asarray(
+        transform_cache.GetLocalToWorldTransform(bread_mesh.GetPrim())
+        * transform_cache.GetLocalToWorldTransform(stage.GetPrimAtPath('/World/Task')).GetInverse())
+    if not np.allclose(relative_transform[:3, :3], np.eye(3), atol=1e-8):
+        raise ValueError('Bread reference mesh must share the simulation axes inside /World/Task')
+    bread_offset = relative_transform[3, :3].astype(np.float32)
+    bread_binding = BreadDeformation(bread_particles[0], bread_rest_local + bread_offset, bread_rest_normals)
+    bread_deformation_frames = []
+    bread_probe_ids = np.linspace(0, len(bread_rest_local) - 1, 4096).astype(int)
+    bread_readback_error = 0.0
 
     butter = UsdGeom.Mesh.Define(stage, "/World/Task/Butter/Surface")
     butter.CreateSubdivisionSchemeAttr("none")
@@ -150,6 +171,21 @@ try:
     for i in range(args.start_frame, args.start_frame + count):
         pos = knife_positions[i]
         set_knife_pose(pos)
+        bread_points, bread_normals, minimum_jacobian = bread_binding.deform(bread_particles[i])
+        bread_local_points = bread_points - bread_offset
+        bread_mesh.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(bread_local_points))
+        bread_mesh.GetNormalsAttr().Set(Vt.Vec3fArray.FromNumpy(bread_normals))
+        bread_mesh.CreateExtentAttr().Set(Vt.Vec3fArray.FromNumpy(np.stack(
+            (bread_local_points.min(axis=0), bread_local_points.max(axis=0)))))
+        actual_points = np.asarray(bread_mesh.GetPointsAttr().Get())
+        bread_readback_error = max(bread_readback_error, float(np.max(np.abs(
+            actual_points[bread_probe_ids] - bread_local_points[bread_probe_ids]))))
+        bread_displacement = bread_points - bread_binding.rest
+        bread_deformation_frames.append(dict(
+            source_frame=i, time_s=float(data['time_s'][i]),
+            max_vertex_displacement_m=float(np.linalg.norm(bread_displacement, axis=1).max()),
+            max_vertex_downward_m=float(-bread_displacement[:, 2].min()),
+            minimum_deformation_jacobian=minimum_jacobian))
         v0, v1 = vertex_offsets[i:i + 2]
         f0, f1 = face_offsets[i:i + 2]
         verts = surface_vertices[v0:v1]
@@ -201,6 +237,11 @@ try:
         'no_hand_model':not bool(stage.GetPrimAtPath('/World/RestingHand')),
         'cdmpm_bread_vertices':len(bread_prim.GetAttribute('points').Get()) if bread_prim else 0,
         'flat_blade_present':bool(stage.GetPrimAtPath('/World/Task/Knife/FlatBlade')),
+        'bread_library_unchanged': bool(np.array_equal(
+            np.asarray(bread_prim.GetAttribute('points').Get()), bread_rest_local)),
+        'task_bread_is_independently_deformable': not bread_root.IsInstanceable(),
+        'background_bread_remains_instanced': all(
+            stage.GetPrimAtPath(f'/World/Stack/Slice{i}').IsInstance() for i in range(4)),
     }
     args.output.with_suffix(".json").write_text(json.dumps({
         "source": str(args.state), "video": str(args.output),
@@ -215,6 +256,13 @@ try:
         "bread_reference": 'https://joshuahwolper.com/cdmpm',
         "video_reference": 'assets/reference/video/source.json',
         "scene_audit": scene_audit,
+        "bread_deformation": {
+            "method": "reference_trilinear_mpm_displacement", "displacement_gain": 1.0,
+            "source_particle_count": int(bread_particles.shape[1]),
+            "mesh_vertex_count": len(bread_rest_local), "normal_transport": "inverse_transpose",
+            "usd_readback_max_error_m": bread_readback_error,
+            "frames": bread_deformation_frames,
+        },
         "usd_stage": str(stage_path.resolve()) if not args.skip_stage else None,
     }, indent=2), encoding="utf-8")
     print(f"Saved {args.output}", flush=True)
