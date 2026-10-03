@@ -39,19 +39,9 @@ except ValueError:
 else:
     raise AssertionError('Inverted deformation must fail')
 
-# Compare literal configuration to the original Genesis cream defaults without
-# importing its CLI or creating a GPU scene.
-def constants(path):
-    result = {}
-    for node in ast.parse(path.read_text(encoding='utf-8')).body:
-        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            try:
-                result[node.targets[0].id] = ast.literal_eval(node.value)
-            except (ValueError, TypeError):
-                pass
-    return result
-
-cream = constants(root.parent / 'genesis-world/examples/cream/cream.py')
+# Compare demo parameters with the bundled snapshot of the Genesis calibration.
+import json
+cream = json.loads((root / 'physics/genesis-bread-defaults.json').read_text())
 tree = ast.parse((root/'scripts/simulate_mpm.py').read_text())
 bread = next(n.value for n in tree.body if isinstance(n, ast.Assign)
              and isinstance(n.targets[0], ast.Name) and n.targets[0].id == 'BREAD')

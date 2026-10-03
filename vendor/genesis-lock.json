@@ -1,0 +1,23 @@
+{
+  "repository": "https://github.com/Genesis-Embodied-AI/genesis-world",
+  "commit": "7cd75da686864bb229efebf19d9c689ce198ea57",
+  "archive_url": "https://codeload.github.com/Genesis-Embodied-AI/genesis-world/zip/7cd75da686864bb229efebf19d9c689ce198ea57",
+  "patch_sha256": "5ed98b1e8f14870db576140c758d0b481abaab0e03b8de4ed86a5232803cc405",
+  "patched_files": {
+    "genesis/engine/entities/mpm_entity.py": "9e540c29dffd9e4e507fe6532a7ca1847973125d7e34004a72e1f2ba0ccc4695",
+    "genesis/engine/materials/MPM/__init__.py": "3b0da2d768e13c0fcef3df7861646ddf8b05133ea3b14a8c9f6f25222b7ee290",
+    "genesis/engine/materials/MPM/base.py": "33d65d9fee89316c868bb4594851c50043620b4a4b0ed74071487dc0299cb850",
+    "genesis/engine/materials/MPM/elastic.py": "a5cac9b1d1ffa1141bb3e45bf12ddd81f0b318afa9974802b60f95c7dc047f57",
+    "genesis/engine/materials/MPM/liquid.py": "ea7668977870e25e41df20fb4e3efff6731b8b51ba589c9f2b6f163320f17313",
+    "genesis/engine/materials/MPM/muscle.py": "bdc3b06bd7cd053b45cb87549aa62b3d63bb831fcae67ae445c7822279a8e7c8",
+    "genesis/engine/materials/MPM/nacc.py": "c93c8c0eae2687c9d1ee282ed40515324c2e07c60576e10311b099389976aa89",
+    "genesis/engine/materials/MPM/phase_field.py": "00d79f3842e86e1047099829ea909780053432d2e1f9971870f910daa9267980",
+    "genesis/engine/materials/MPM/sand.py": "1d2f1a853e8dbec5818d458d8f12a077f97b1da29a912f9c332e6b92360148d4",
+    "genesis/engine/materials/MPM/snow.py": "f6da44eec5f423ea59c229aec3255af119774f3371427b5617a749d67196dab6",
+    "genesis/engine/solvers/mpm_solver.py": "7e9588da6942e26b7a2ef42076246504c8d7974bbfaf3e19144f9e120c121236",
+    "genesis/engine/states/entities.py": "f0001557ee0ed11d1dab69de71abbbed17fc6467dbc58ecf143aa56cedd79835",
+    "genesis/engine/states/solvers.py": "fc91b3a17f21430cdb25057f5c73e3f664f6fdd148e9915d5e16d885c57cbad6"
+  },
+  "version": "1.3.3",
+  "archive_sha256": "a686ad60b7f9e25e246e4fe83c385d1b310abceda93b67e8fd8706c7b1fd1b50"
+}

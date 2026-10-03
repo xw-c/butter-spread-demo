@@ -10,13 +10,8 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE = ROOT.parent
-GENESIS = WORKSPACE / "genesis-world"
-CREAM = GENESIS / "examples" / "cream"
-if not CREAM.is_dir():
-    raise RuntimeError(f"Missing calibrated material sources: {CREAM}")
-sys.path.insert(0, str(GENESIS))
-sys.path.insert(0, str(CREAM))
+from genesis_runtime import activate
+GENESIS = activate()
 
 import genesis as gs
 from knife_motion import knife_pose, PRESS_END_S, ACCEL_END_S, SPREAD_END_S, LIFT_END_S
@@ -90,13 +85,13 @@ def main():
     contact_parameters = {**CONTACT, "blade_stress": args.blade_stress,
                           "blade_shear_stress": args.blade_shear_stress}
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("GS_CACHE_FILE_PATH", str(WORKSPACE / ".cache" / "genesis"))
+    os.environ.setdefault("GS_CACHE_FILE_PATH", str(ROOT / ".cache" / "genesis"))
     started = time.perf_counter()
 
     gs.init(backend=gs.gpu if args.backend == "gpu" else gs.cpu,
             logging_level="warning", theme="dumb")
-    from cream_contact import ButterContact
-    from cream_materials import HerschelBulkleyButter, PorousBread
+    from physics.cream_contact import ButterContact
+    from physics.cream_materials import HerschelBulkleyButter, PorousBread
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(dt=args.dt, substeps=1, gravity=(0, 0, -9.81)),
         mpm_options=gs.options.MPMOptions(

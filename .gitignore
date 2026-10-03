@@ -1,6 +1,10 @@
 # Generated simulation and render outputs
 /outputs/
 /.vendor/
+/.cache/
+/.venv-physics/
+/.venv-isaac/
+/validation/
 
 # Large intermediate mesh products; rebuild from the bundled source VDB archive
 /assets/reference/cdmpm/breadxxx.vdb

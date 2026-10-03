@@ -11,7 +11,12 @@ ROOT=Path(__file__).resolve().parents[1]
 def crumb_material(stage):
     mat=_material(stage,'CDMPM_Crumb',(.70,.66,.56),.91)
     shader=UsdShade.Shader.Define(stage,'/World/Looks/CDMPM_Crumb/Scattering')
-    mdl=ROOT.parent/'lw-runtime/Lib/site-packages/isaacsim/kit/mdl/core/Base/OmniSurface.mdl'
+    # Resolve through the running Kit application, including standalone Isaac
+    # installs and Linux environments; never assume a sibling Python folder.
+    import carb.tokens
+    mdl=Path(carb.tokens.get_tokens_interface().resolve('${kit}'))/'mdl/core/Base/OmniSurface.mdl'
+    if not mdl.is_file():
+        raise RuntimeError(f'Isaac Kit OmniSurface material is missing: {mdl}')
     shader.CreateImplementationSourceAttr().Set(UsdShade.Tokens.sourceAsset)
     shader.SetSourceAsset(Sdf.AssetPath(str(mdl)),'mdl')
     shader.SetSourceAssetSubIdentifier('OmniSurface','mdl')

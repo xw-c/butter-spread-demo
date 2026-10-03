@@ -1,0 +1,1240 @@
+diff --git a/genesis/engine/entities/mpm_entity.py b/genesis/engine/entities/mpm_entity.py
+index f700601b..0fff2864 100644
+--- a/genesis/engine/entities/mpm_entity.py
++++ b/genesis/engine/entities/mpm_entity.py
+@@ -99,6 +99,16 @@ class MPMEntity(ParticleEntity):
+             self.set_muscle_group(self.mesh_set_group_ids)
+ 
+     def _add_particles_to_solver(self):
++        phase_enabled = bool(getattr(self._material, "use_phase_field", False))
++        phase_l0 = 0.0
++        phase_inv_toughness = 0.0
++        phase_residual = 1.0
++        phase_mobility = 0.0
++        if phase_enabled:
++            phase_l0 = self._material.length_scale or 0.5 * self._solver._dx
++            phase_inv_toughness = 1.0 / self._material.fracture_toughness
++            phase_residual = self._material.residual_stiffness
++            phase_mobility = self._material.mobility
+         self._solver._kernel_add_particles(
+             self._sim.cur_substep_local,
+             self.active,
+@@ -107,6 +117,13 @@ class MPMEntity(ParticleEntity):
+             self._material.idx,
+             self._material._default_Jp,
+             self._material.rho,
++            self._particle_size**3 * self._solver._particle_volume_scale,
++            phase_enabled,
++            phase_enabled,
++            phase_l0,
++            phase_inv_toughness,
++            phase_residual,
++            phase_mobility,
+             self._particles,
+         )
+ 
+@@ -293,6 +310,8 @@ class MPMEntity(ParticleEntity):
+             C=state.C,
+             F=state.F,
+             Jp=state.Jp,
++            phase=state.phase,
++            phase_history=state.phase_history,
+             active=state.active,
+         )
+ 
+@@ -310,6 +329,8 @@ class MPMEntity(ParticleEntity):
+         C: qd.types.ndarray(),  # shape [B, n_particles, 3, 3]
+         F: qd.types.ndarray(),  # shape [B, n_particles, 3, 3]
+         Jp: qd.types.ndarray(),  # shape [B, n_particles]
++        phase: qd.types.ndarray(),  # shape [B, n_particles]
++        phase_history: qd.types.ndarray(),  # shape [B, n_particles]
+         active: qd.types.ndarray(),  # shape [B, n_particles]
+     ):
+         """
+@@ -344,6 +365,8 @@ class MPMEntity(ParticleEntity):
+                     F[i_b, i_p, j, k] = self._solver.particles[f, i_global, i_b].F[j, k]
+             # Copy Jp, active
+             Jp[i_b, i_p] = self._solver.particles[f, i_global, i_b].Jp
++            phase[i_b, i_p] = self._solver.particles_ng[f, i_global, i_b].phase
++            phase_history[i_b, i_p] = self._solver.particles_ng[f, i_global, i_b].phase_history
+             active[i_b, i_p] = self._solver.particles_ng[f, i_global, i_b].active
+ 
+     # ------------------------------------------------------------------------------------
+@@ -689,6 +712,32 @@ class MPMEntity(ParticleEntity):
+ 
+         self._solver._kernel_remove_particle_constraints(particles_mask, self._particle_start)
+ 
++    @gs.assert_built
++    def set_particle_phase_damage_enabled(self, particles_mask, enabled):
++        """Enable or disable phase-field damage for selected particles.
++
++        This is the MPM equivalent of Ziran's per-particle ``allow_damage``
++        flag and is useful for non-fracturing loading/grip regions.  Particle
++        mechanics remain active; only phase evolution is disabled.
++        """
++        if not isinstance(enabled, bool):
++            gs.raise_exception("enabled must be a boolean.")
++        if (
++            particles_mask.ndim != 2
++            or particles_mask.shape[0] != self._sim._B
++            or particles_mask.shape[1] != self.n_particles
++        ):
++            gs.raise_exception("particles_mask must have shape (n_envs, n_particles).")
++        if particles_mask.shape[0] > 1 and not torch.equal(
++            particles_mask, particles_mask[0:1].expand_as(particles_mask)
++        ):
++            gs.raise_exception(
++                "Phase damage enablement is static particle data, so particles_mask must be identical across envs."
++            )
++        self._solver._kernel_set_particle_phase_damage_enabled(
++            particles_mask, self._particle_start, enabled
++        )
++
+     # ------------------------------------------------------------------------------------
+     # --------------------------------- naming methods -----------------------------------
+     # ------------------------------------------------------------------------------------
+diff --git a/genesis/engine/materials/MPM/__init__.py b/genesis/engine/materials/MPM/__init__.py
+index 1bb7fd1f..449fb0f0 100644
+--- a/genesis/engine/materials/MPM/__init__.py
++++ b/genesis/engine/materials/MPM/__init__.py
+@@ -3,5 +3,7 @@ from .elastic import Elastic
+ from .elasto_plastic import ElastoPlastic
+ from .liquid import Liquid
+ from .muscle import Muscle
++from .nacc import NACC
++from .phase_field import PhaseField
+ from .sand import Sand
+ from .snow import Snow
+diff --git a/genesis/engine/materials/MPM/base.py b/genesis/engine/materials/MPM/base.py
+index 78bdcf19..03fa3921 100644
+--- a/genesis/engine/materials/MPM/base.py
++++ b/genesis/engine/materials/MPM/base.py
+@@ -55,6 +55,9 @@ class Base(Material["MPMEntity"]):
+         The second Lame's parameter. Default is None, computed from E and nu.
+     sampler : str, optional
+         Particle sampler ('pbs', 'regular', 'random'). Default is platform-dependent.
++    particle_size : float, optional
++        Per-material quadrature spacing. None uses the solver default. Each
++        particle's mass and stress integration weight use this spacing cubed.
+     """
+ 
+     E: PositiveFloat = 1e6
+@@ -63,6 +66,7 @@ class Base(Material["MPMEntity"]):
+     lam: ValidFloat | None = None
+     mu: ValidFloat | None = None
+     sampler: SamplerType = DEFAULT_SAMPLER
++    particle_size: PositiveFloat | None = None
+ 
+     # Dispatch fields - set by subclass model_post_init, not user-specified. needs_svd flips the solver's forward-mode
+     # SVD kernel off when no material in the scene reads U/V/S from SVD(F_tmp) (e.g. non-viscous liquid, neohooken
+@@ -95,7 +99,7 @@ class Base(Material["MPMEntity"]):
+         raise NotImplementedError
+ 
+     @qd.func
+-    def _update_stress_default(self, U, S, V, F_tmp, F_new, J, Jp, actu, m_dir):
++    def _update_stress_default(self, U, S, V, F_tmp, F_new, J, Jp, actu, m_dir, phase):
+         stress = 2 * self.mu * (F_new - U @ V.transpose()) @ F_new.transpose() + qd.Matrix.identity(
+             gs.qd_float, 3
+         ) * self.lam * J * (J - 1)
+diff --git a/genesis/engine/materials/MPM/elastic.py b/genesis/engine/materials/MPM/elastic.py
+index 98ad7b8e..41302c3f 100644
+--- a/genesis/engine/materials/MPM/elastic.py
++++ b/genesis/engine/materials/MPM/elastic.py
+@@ -50,14 +50,14 @@ class Elastic(Base):
+         return F_new, S_new, Jp_new
+ 
+     @qd.func
+-    def _update_stress_corotation(self, U, S, V, F_tmp, F_new, J, Jp, actu, m_dir):
++    def _update_stress_corotation(self, U, S, V, F_tmp, F_new, J, Jp, actu, m_dir, phase):
+         stress = 2 * self.mu * (F_new - U @ V.transpose()) @ F_new.transpose() + qd.Matrix.identity(
+             gs.qd_float, 3
+         ) * self.lam * J * (J - 1)
+         return stress
+ 
+     @qd.func
+-    def _update_stress_neohooken(self, U, S, V, F_tmp, F_new, J, Jp, actu, m_dir):
++    def _update_stress_neohooken(self, U, S, V, F_tmp, F_new, J, Jp, actu, m_dir, phase):
+         stress = self.mu * (F_tmp @ F_tmp.transpose()) + qd.Matrix.identity(gs.qd_float, 3) * (
+             self.lam * qd.log(J) - self.mu
+         )
+diff --git a/genesis/engine/materials/MPM/liquid.py b/genesis/engine/materials/MPM/liquid.py
+index 2dbfd08c..cdb0da11 100644
+--- a/genesis/engine/materials/MPM/liquid.py
++++ b/genesis/engine/materials/MPM/liquid.py
+@@ -45,7 +45,7 @@ class Liquid(Base):
+         return F_new, S_new, Jp_new
+ 
+     @qd.func
+-    def _update_stress_liquid(self, U, S, V, F_tmp, F_new, J, Jp, actu, m_dir):
++    def _update_stress_liquid(self, U, S, V, F_tmp, F_new, J, Jp, actu, m_dir, phase):
+         stress = 2 * self.mu * (F_tmp - U @ V.transpose()) @ F_tmp.transpose() + qd.Matrix.identity(
+             gs.qd_float, 3
+         ) * self.lam * J * (J - 1)
+diff --git a/genesis/engine/materials/MPM/muscle.py b/genesis/engine/materials/MPM/muscle.py
+index 99943fb2..433a1612 100644
+--- a/genesis/engine/materials/MPM/muscle.py
++++ b/genesis/engine/materials/MPM/muscle.py
+@@ -44,8 +44,8 @@ class Muscle(Elastic):
+         self.update_stress = self._update_stress_with_actuation
+ 
+     @qd.func
+-    def _update_stress_with_actuation(self, U, S, V, F_tmp, F_new, J, Jp, actu, m_dir):
+-        stress = self._update_stress_without_actuation(U, S, V, F_tmp, F_new, J, Jp, actu, m_dir)
++    def _update_stress_with_actuation(self, U, S, V, F_tmp, F_new, J, Jp, actu, m_dir, phase):
++        stress = self._update_stress_without_actuation(U, S, V, F_tmp, F_new, J, Jp, actu, m_dir, phase)
+ 
+         AAt = m_dir.outer_product(m_dir)
+         stress += self.stiffness * actu * F_tmp @ AAt @ F_tmp.transpose()
+diff --git a/genesis/engine/materials/MPM/nacc.py b/genesis/engine/materials/MPM/nacc.py
+new file mode 100644
+index 00000000..66096adf
+--- /dev/null
++++ b/genesis/engine/materials/MPM/nacc.py
+@@ -0,0 +1,164 @@
++import math
++from typing import Annotated, Any
++
++import quadrants as qd
++from pydantic import Field, StrictBool
++
++import genesis as gs
++from genesis.typing import NonNegativeFloat, PositiveFloat, ValidFloat
++
++from .base import Base
++
++
++@qd.data_oriented
++class NACC(Base):
++    """Non-Associated Cam-Clay plasticity from Wolper et al. (2019).
++
++    This is the local, fracture-friendly plasticity component of CD-MPM.  It
++    uses the Borden Neo-Hookean energy and the analytical three-case NACC
++    return mapping from the authors' Ziran implementation.  It does not
++    include CD-MPM's phase field, damage variable, or non-local crack solve.
++
++    ``Jp`` in the stock Genesis MPM particle state stores NACC's scalar
++    hardening variable ``alpha`` (called ``logJp`` in the Ziran code).  This
++    lets the model run without changing the MPM solver or particle layout.
++
++    Parameters
++    ----------
++    E, nu, rho, sampler
++        Standard MPM material and sampling parameters inherited from ``Base``.
++    initial_log_jp : float, optional
++        Initial hardening state alpha_0 = log(Jp_0).  Negative values give a
++        finite initial yield surface.  Default is log(0.99).
++    friction_angle : float, optional
++        Friction angle in degrees.  It is converted to the NACC yield-surface
++        parameter M using the formula in the released Ziran code.  Default is
++        58 degrees (M approximately 2.36 in 3D).
++    beta : float, optional
++        Cohesion coefficient controlling the tensile side of the yield
++        surface.  Default is 0.5.
++    xi : float, optional
++        Hardening/softening rate.  Default is 1.0.
++    hardening : bool, optional
++        Whether to evolve alpha after plastic projection.  Default is True.
++    """
++
++    initial_log_jp: ValidFloat = math.log(0.99)
++    friction_angle: Annotated[ValidFloat, Field(gt=0.0, lt=90.0)] = 58.0
++    beta: NonNegativeFloat = 0.5
++    xi: NonNegativeFloat = 1.0
++    hardening: StrictBool = True
++
++    # Derived parameters.  K is named kappa to match the paper and Ziran.
++    M: PositiveFloat = Field(default=1.0, exclude=True)
++    kappa: PositiveFloat = Field(default=1.0, exclude=True)
++
++    def model_post_init(self, context: Any) -> None:
++        super().model_post_init(context)
++
++        self.kappa = self.lam + (2.0 / 3.0) * self.mu
++        sin_phi = math.sin(math.radians(self.friction_angle))
++        mohr_coulomb_friction = math.sqrt(2.0 / 3.0) * 2.0 * sin_phi / (3.0 - sin_phi)
++        self.M = mohr_coulomb_friction * 3.0 / math.sqrt(2.0 / 3.0)
++
++        # Reuse the one scalar history slot already present on every Genesis
++        # MPM particle.  For NACC it is alpha, not a plastic volume ratio.
++        self._default_Jp = float(self.initial_log_jp)
++        self.update_F_S_Jp = self._update_F_S_Jp_nacc
++        self.update_stress = self._update_stress_nacc
++        self.needs_svd = True
++
++    @qd.func
++    def _update_F_S_Jp_nacc(self, J, F_tmp, U, S, V, Jp):
++        """Apply the analytical NACC return map to the trial elastic F."""
++        dim = qd.static(3)
++        eps = gs.qd_float(1.0e-8)
++
++        sigma_sq = qd.Vector.zero(gs.qd_float, 3)
++        sigma_new = qd.Matrix.zero(gs.qd_float, 3, 3)
++        for d in qd.static(range(3)):
++            sigma_sq[d] = S[d, d] * S[d, d]
++            sigma_new[d, d] = S[d, d]
++
++        J_trial = qd.max(J, eps)
++        mean_b = sigma_sq.sum() / 3.0
++        s_trial = self.mu * J_trial ** (-2.0 / 3.0) * (sigma_sq - mean_b)
++        s_trial_norm = s_trial.norm(eps)
++
++        # Compression is positive pressure in the CD-MPM convention.
++        p_trial = -0.5 * self.kappa * (J_trial * J_trial - 1.0)
++        hardening_argument = self.xi * qd.max(-Jp, 0.0)
++        sinh_argument = 0.5 * (qd.exp(hardening_argument) - qd.exp(-hardening_argument))
++        p0 = self.kappa * (1.0e-5 + sinh_argument)
++
++        alpha_new = Jp
++        projected = gs.qd_bool(False)
++
++        # Cases 1 and 2: the trial pressure lies beyond an ellipsoid tip.
++        p_projected = gs.qd_float(0.0)
++        if p_trial > p0:
++            p_projected = p0
++            projected = True
++        elif p_trial < -self.beta * p0:
++            p_projected = -self.beta * p0
++            projected = True
++
++        if projected:
++            J_new = qd.sqrt(qd.max(1.0 - 2.0 * p_projected / self.kappa, eps))
++            isotropic_stretch = J_new ** (1.0 / dim)
++            for d in qd.static(range(3)):
++                sigma_new[d, d] = isotropic_stretch
++            if qd.static(self.hardening):
++                alpha_new += qd.log(J_trial / J_new)
++        else:
++            # Case 3: preserve pressure/volume and radially return the shear
++            # stress to the NACC ellipsoid when the trial state has yielded.
++            shear_coeff = 0.5 * (6.0 - dim) * (1.0 + 2.0 * self.beta)
++            pressure_term = self.M * self.M * (p_trial + self.beta * p0) * (p_trial - p0)
++            yield_value = shear_coeff * s_trial_norm * s_trial_norm + pressure_term
++
++            if yield_value >= 1.0e-4:
++                target_s_norm = qd.sqrt(qd.max(-pressure_term / shear_coeff, 0.0))
++                b_new = target_s_norm / self.mu * J_trial ** (2.0 / 3.0) * s_trial / s_trial_norm + mean_b
++                for d in qd.static(range(3)):
++                    sigma_new[d, d] = qd.sqrt(qd.max(b_new[d], eps))
++
++                if qd.static(self.hardening):
++                    # Fracture-friendly shear hardening/softening: intersect
++                    # the center-to-trial ray with the yield ellipse and use
++                    # its pressure to update alpha.  This is the exact closed
++                    # form used by the released Ziran implementation.
++                    p_center = 0.5 * (1.0 - self.beta) * p0
++                    if p0 > 1.0e-4 and p_trial < p0 - 1.0e-4 and p_trial > -self.beta * p0 + 1.0e-4:
++                        aa = (
++                            self.M
++                            * self.M
++                            * (p_trial - p_center)
++                            * (p_trial - p_center)
++                            / (shear_coeff * s_trial_norm * s_trial_norm)
++                        )
++                        dd = 1.0 + aa
++                        ff = aa * self.beta * p0 - aa * p0 - 2.0 * p_center
++                        gg = p_center * p_center - aa * self.beta * p0 * p0
++                        root = qd.sqrt(qd.abs(ff * ff - 4.0 * dd * gg))
++                        p1 = (-ff + root) / (2.0 * dd)
++                        p2 = (-ff - root) / (2.0 * dd)
++                        p_intersection = p2
++                        if (p_trial - p_center) * (p1 - p_center) > 0.0:
++                            p_intersection = p1
++                        J_intersection = qd.sqrt(qd.abs(1.0 - 2.0 * p_intersection / self.kappa))
++                        if J_intersection > 1.0e-4:
++                            alpha_new += qd.log(J_trial / J_intersection)
++
++        F_new = U @ sigma_new @ V.transpose()
++        return F_new, sigma_new, alpha_new
++
++    @qd.func
++    def _update_stress_nacc(self, U, S, V, F_tmp, F_new, J, Jp, actu, m_dir, phase):
++        """Kirchhoff stress of the undegraded Borden Neo-Hookean energy."""
++        J_elastic = qd.max(S[0, 0] * S[1, 1] * S[2, 2], 1.0e-8)
++        b = F_new @ F_new.transpose()
++        dev_b = b - qd.Matrix.identity(gs.qd_float, 3) * (b.trace() / 3.0)
++        stress = self.mu * J_elastic ** (-2.0 / 3.0) * dev_b
++        stress += qd.Matrix.identity(gs.qd_float, 3) * (0.5 * self.kappa * (J_elastic * J_elastic - 1.0))
++        return stress
+diff --git a/genesis/engine/materials/MPM/phase_field.py b/genesis/engine/materials/MPM/phase_field.py
+new file mode 100644
+index 00000000..395e9de8
+--- /dev/null
++++ b/genesis/engine/materials/MPM/phase_field.py
+@@ -0,0 +1,98 @@
++from typing import Annotated, Any
++
++import quadrants as qd
++from pydantic import Field, StrictInt
++
++import genesis as gs
++from genesis.typing import NonNegativeFloat, PositiveFloat, ValidFloat
++
++from .base import Base
++
++
++@qd.data_oriented
++class PhaseField(Base):
++    """Brittle phase-field fracture material used by CD-MPM/PFF-MPM.
++
++    This material implements the tensile/compressive split of the Borden
++    Neo-Hookean energy from Wolper et al. (2019).  The accompanying non-local
++    phase-field equation is solved by :class:`MPMSolver`; ``c=1`` denotes
++    intact material and ``c=0`` fully damaged material.
++
++    Parameters
++    ----------
++    fracture_toughness : float
++        Critical energy release rate ``G`` in J/m^2.
++    length_scale : float
++        Phase-field regularization length ``l0`` in meters.  Zero selects the
++        paper's MPM default, ``l0 = 0.5 * grid_dx``.
++    mobility : float
++        Ginzburg--Landau mobility ``Mc``.  Positive values use the parabolic
++        backward-Euler phase evolution from Eq. (6).  Zero selects its
++        rate-independent elliptic limit.
++    residual_stiffness : float
++        Residual tensile stiffness ``r`` in ``g(c)=(1-r)c^2+r``.
++    cg_max_iterations, cg_tolerance
++        Maximum iterations and relative residual tolerance for the grid phase
++        solve.  The released Ziran examples generally converge in 1--4 CG
++        iterations; a larger default is used here for robustness.
++    """
++
++    E: PositiveFloat = 2.0e6
++    nu: Annotated[ValidFloat, Field(gt=-1.0, lt=0.5)] = 0.22
++    rho: PositiveFloat = 550.0
++
++    fracture_toughness: PositiveFloat = 20.0
++    length_scale: NonNegativeFloat = 0.0
++    mobility: NonNegativeFloat = 1.0
++    residual_stiffness: Annotated[ValidFloat, Field(gt=0.0, le=1.0)] = 1.0e-3
++    cg_max_iterations: Annotated[StrictInt, Field(ge=1)] = 12
++    cg_tolerance: PositiveFloat = 1.0e-5
++    kappa: PositiveFloat = Field(default=1.0, exclude=True)
++
++    def model_post_init(self, context: Any) -> None:
++        super().model_post_init(context)
++
++        self.kappa = self.lam + (2.0 / 3.0) * self.mu
++        self.update_F_S_Jp = self._update_F_S_Jp_phase_field
++        self.update_stress = self._update_stress_phase_field
++        self.needs_svd = False
++
++    @property
++    def use_phase_field(self) -> bool:
++        return True
++
++    @qd.func
++    def _update_F_S_Jp_phase_field(self, J, F_tmp, U, S, V, Jp):
++        return F_tmp, S, Jp
++
++    @qd.func
++    def _update_stress_phase_field(self, U, S, V, F_tmp, F_new, J, Jp, actu, m_dir, phase):
++        """Degraded Kirchhoff stress of Eq. (3) and Eqs. (8)--(10)."""
++        eps = gs.qd_float(1.0e-8)
++        J_elastic = qd.max(F_new.determinant(), eps)
++        b = F_new @ F_new.transpose()
++        dev_b = b - qd.Matrix.identity(gs.qd_float, 3) * (b.trace() / 3.0)
++
++        tau_dev = self.mu * J_elastic ** (-2.0 / 3.0) * dev_b
++        tau_vol = qd.Matrix.identity(gs.qd_float, 3) * (
++            0.5 * self.kappa * (J_elastic * J_elastic - 1.0)
++        )
++        degradation = (1.0 - self.residual_stiffness) * phase * phase + self.residual_stiffness
++
++        stress = degradation * tau_dev + tau_vol
++        if J_elastic >= 1.0:
++            stress = degradation * (tau_dev + tau_vol)
++        return stress
++
++    @qd.func
++    def _positive_energy(self, F):
++        """Undegraded tensile energy density ``Psi+`` used by the history field."""
++        eps = gs.qd_float(1.0e-8)
++        J = qd.max(F.determinant(), eps)
++        frobenius_sq = (F.transpose() @ F).trace()
++        psi_dev = 0.5 * self.mu * (J ** (-2.0 / 3.0) * frobenius_sq - 3.0)
++        psi_vol = 0.5 * self.kappa * (0.5 * (J * J - 1.0) - qd.log(J))
++        psi_pos = qd.max(psi_dev, 0.0)
++        if J >= 1.0:
++            psi_pos = qd.max(psi_dev + psi_vol, 0.0)
++        return psi_pos
+diff --git a/genesis/engine/materials/MPM/sand.py b/genesis/engine/materials/MPM/sand.py
+index f30b42fe..ea8b42c5 100644
+--- a/genesis/engine/materials/MPM/sand.py
++++ b/genesis/engine/materials/MPM/sand.py
+@@ -72,7 +72,7 @@ class Sand(Base):
+         return F_new, S_new, Jp_new
+ 
+     @qd.func
+-    def _update_stress_sand(self, U, S, V, F_tmp, F_new, J, Jp, actu, m_dir):
++    def _update_stress_sand(self, U, S, V, F_tmp, F_new, J, Jp, actu, m_dir, phase):
+         log_S_sum = gs.qd_float(0.0)
+         center = qd.Matrix.zero(gs.qd_float, 3, 3)
+         for i in qd.static(range(3)):
+diff --git a/genesis/engine/materials/MPM/snow.py b/genesis/engine/materials/MPM/snow.py
+index c742ead2..700aeccb 100644
+--- a/genesis/engine/materials/MPM/snow.py
++++ b/genesis/engine/materials/MPM/snow.py
+@@ -63,7 +63,7 @@ class Snow(ElastoPlastic):
+         return F_new, S_new, Jp_new
+ 
+     @qd.func
+-    def _update_stress_snow(self, U, S, V, F_tmp, F_new, J, Jp, actu, m_dir):
++    def _update_stress_snow(self, U, S, V, F_tmp, F_new, J, Jp, actu, m_dir, phase):
+         # Hardening coefficient: material harder when compressed
+         h = qd.exp(10 * (1.0 - Jp))
+         mu, lam = self.mu * h, self.lam * h
+diff --git a/genesis/engine/solvers/mpm_solver.py b/genesis/engine/solvers/mpm_solver.py
+index ca649430..e0a4054d 100644
+--- a/genesis/engine/solvers/mpm_solver.py
++++ b/genesis/engine/solvers/mpm_solver.py
+@@ -69,6 +69,9 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+         self._materials_idx = list()
+         self._materials_update_F_S_Jp = list()
+         self._materials_update_stress = list()
++        self._phase_materials_idx = list()
++        self._phase_materials_positive_energy = list()
++        self._use_phase_field = False
+ 
+         # boundary
+         self.setup_boundary()
+@@ -96,14 +99,25 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+         )
+ 
+         # dynamic particle state without gradient
+-        struct_particle_state_ng = qd.types.struct(active=gs.qd_bool)
++        struct_particle_state_ng = qd.types.struct(
++            active=gs.qd_bool,
++            phase=gs.qd_float,  # PFF c: 1 intact, 0 fully damaged
++            phase_history=gs.qd_float,  # irreversible max tensile energy density H
++        )
+ 
+         # static particle info
+         struct_particle_info = qd.types.struct(
+             material_idx=gs.qd_int,
+             mass=gs.qd_float,
++            reference_volume=gs.qd_float,
+             default_Jp=gs.qd_float,
+             free=gs.qd_bool,
++            has_phase_field=gs.qd_bool,
++            phase_enabled=gs.qd_bool,
++            phase_l0=gs.qd_float,
++            phase_inv_toughness=gs.qd_float,
++            phase_residual=gs.qd_float,
++            phase_mobility=gs.qd_float,
+             # for muscle
+             muscle_group=gs.qd_int,
+             muscle_direction=gs.qd_vec3,
+@@ -138,6 +152,26 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+             shape=(self._sim.substeps_local, *self._grid_res, self._B), needs_grad=True, layout=qd.Layout.SOA
+         )
+ 
++        if self._use_phase_field:
++            phase_grid_state = qd.types.struct(
++                weight=gs.qd_float,
++                old=gs.qd_float,
++                rhs=gs.qd_float,
++                diag=gs.qd_float,
++                x=gs.qd_float,
++                r=gs.qd_float,
++                z=gs.qd_float,
++                p=gs.qd_float,
++                Ap=gs.qd_float,
++            )
++            # The phase system is solved synchronously within one substep, so it needs no frame axis.
++            self.phase_grid = phase_grid_state.field(shape=(*self._grid_res, self._B), layout=qd.Layout.SOA)
++            self.phase_particle_grad = qd.Vector.field(
++                3, dtype=gs.qd_float, shape=(self._n_particles, self._B)
++            )
++            # Per-environment PCG reductions: rz, pAp, ||r||^2, ||b||^2, rz_new.
++            self.phase_cg_reduce = qd.field(gs.qd_float, shape=(self._B, 5))
++
+         # Sparse-reset bookkeeping for forward-only mode. A single global dirty list captures unique cells touched by
+         # p2g across all envs in the current substep; reset_dirty_cells zeroes those cells across all envs immediately
+         # after g2p, so the grid is always zero at the start of each substep and no per-substep state has to outlive a
+@@ -218,6 +252,13 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+         # p2g via qd.static. Forced True under requires_grad so the backward path stays exactly as upstream.
+         # TODO: validate the J = det(F_tmp) shortcut composes with quadrants autograd before enabling it there.
+         self.needs_svd = self._sim.requires_grad or any(m.needs_svd for m in self._materials)
++        self._use_phase_field = bool(self._phase_materials_idx)
++        if self._use_phase_field:
++            if self._sim.requires_grad:
++                gs.raise_exception("MPM phase-field fracture is not supported in differentiable mode yet.")
++            phase_materials = [m for m in self._materials if getattr(m, "use_phase_field", False)]
++            self._phase_cg_max_iterations = max(m.cg_max_iterations for m in phase_materials)
++            self._phase_cg_tolerance = min(m.cg_tolerance for m in phase_materials)
+ 
+         if self.is_active:
+             if self._enable_CPIC and self._sim.requires_grad:
+@@ -267,7 +308,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+             material=material,
+             morph=morph,
+             surface=surface,
+-            particle_size=self._particle_size,
++            particle_size=material.particle_size or self._particle_size,
+             idx=idx,
+             particle_start=self.n_particles,
+             vvert_start=self.n_vverts,
+@@ -289,6 +330,9 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+             self._materials_idx.append(material.idx)
+             self._materials_update_F_S_Jp.append(material.update_F_S_Jp)
+             self._materials_update_stress.append(material.update_stress)
++            if getattr(material, "use_phase_field", False):
++                self._phase_materials_idx.append(material.idx)
++                self._phase_materials_positive_energy.append(material._positive_energy)
+         self._materials.append(material)
+ 
+     @qd.func
+@@ -401,6 +445,10 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+                 # to identity).
+                 # 2. Jp is only used by Snow material, and it uses Jp from the previous frame, not the updated one.
+                 stress = qd.Matrix.zero(gs.qd_float, 3, 3)
++                stress_phase = self.particles_ng[f, i_p, i_b].phase
++                if qd.static(self._use_phase_field):
++                    if self.particles_info[i_p].phase_enabled:
++                        stress_phase = self.particles_ng[f + 1, i_p, i_b].phase
+                 for material_idx in qd.static(self._materials_idx):
+                     if self.particles_info[i_p].material_idx == material_idx:
+                         stress = self._materials_update_stress[material_idx](
+@@ -413,8 +461,9 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+                             Jp=self.particles[f, i_p, i_b].Jp,
+                             actu=self.particles[f, i_p, i_b].actu,
+                             m_dir=self.particles_info[i_p].muscle_direction,
++                            phase=stress_phase,
+                         )
+-                stress = (-self.substep_dt * self._particle_volume * 4 * self._inv_dx * self._inv_dx) * stress
++                stress = (-self.substep_dt * self.particles_info[i_p].reference_volume * 4 * self._inv_dx * self._inv_dx) * stress
+                 affine = stress + self.particles_info[i_p].mass * self.particles[f, i_p, i_b].C
+ 
+                 # C. project onto grid
+@@ -475,6 +524,300 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+                     if not self.particles_info[i_p].free:  # non-free particles behave as boundary conditions
+                         self.grid[f, base - self._grid_offset + offset, i_b].vel_in = qd.Vector.zero(gs.qd_float, 3)
+ 
++    # ------------------------------------------------------------------------------------
++    # -------------------------- CD-MPM phase-field solve --------------------------------
++    # ------------------------------------------------------------------------------------
++
++    @qd.func
++    def _phase_cell_ijk(self, flat):
++        k = flat % self._grid_res[2]
++        rem = flat // self._grid_res[2]
++        j = rem % self._grid_res[1]
++        i = rem // self._grid_res[1]
++        return qd.Vector([i, j, k], dt=gs.qd_int)
++
++    @qd.kernel
++    def phase_p2g_old(self, f: qd.i32):
++        """PIC transfer of the old particle phase to the active grid."""
++        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
++            if self.particles_ng[f, i_p, i_b].active and self.particles_info[i_p].has_phase_field:
++                base = qd.floor(self.particles[f, i_p, i_b].pos * self._inv_dx - 0.5).cast(gs.qd_int)
++                fx = self.particles[f, i_p, i_b].pos * self._inv_dx - base.cast(gs.qd_float)
++                w = [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1.0) ** 2, 0.5 * (fx - 0.5) ** 2]
++                for offset in qd.static(qd.grouped(self.stencil_range())):
++                    weight = gs.qd_float(1.0)
++                    for d in qd.static(range(3)):
++                        weight *= w[offset[d]][d]
++                    cell_ijk = base - self._grid_offset + offset
++                    qd.atomic_add(self.phase_grid[cell_ijk, i_b].weight, weight)
++                    qd.atomic_add(
++                        self.phase_grid[cell_ijk, i_b].old,
++                        weight * self.particles_ng[f, i_p, i_b].phase,
++                    )
++                    if qd.static(not self._sim.requires_grad):
++                        was_dirty = qd.atomic_or(self.grid_dirty_flag[cell_ijk], gs.qd_int(1))
++                        if was_dirty == gs.qd_int(0):
++                            slot_idx = qd.atomic_add(self.grid_dirty_count[0], 1)
++                            flat = (cell_ijk[0] * self._grid_res[1] + cell_ijk[1]) * self._grid_res[2] + cell_ijk[2]
++                            self.grid_dirty_list[slot_idx] = flat
++
++    @qd.kernel
++    def phase_update_history(self, f: qd.i32):
++        """Update H with the tensile energy at F^n before solving for c^(n+1)."""
++        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
++            if self.particles_ng[f, i_p, i_b].active and self.particles_info[i_p].has_phase_field:
++                positive_energy = gs.qd_float(0.0)
++                for phase_material_i in qd.static(range(len(self._phase_materials_idx))):
++                    if self.particles_info[i_p].material_idx == self._phase_materials_idx[phase_material_i]:
++                        positive_energy = self._phase_materials_positive_energy[phase_material_i](
++                            self.particles[f, i_p, i_b].F
++                        )
++                self.particles_ng[f, i_p, i_b].phase_history = qd.max(
++                    self.particles_ng[f, i_p, i_b].phase_history, positive_energy
++                )
++
++    @qd.kernel
++    def phase_normalize_old(self):
++        for slot in range(self.grid_dirty_count[0]):
++            cell_ijk = self._phase_cell_ijk(self.grid_dirty_list[slot])
++            for i_b in range(self._B):
++                weight = self.phase_grid[cell_ijk, i_b].weight
++                if weight > 1.0e-12:
++                    self.phase_grid[cell_ijk, i_b].old /= weight
++
++    @qd.kernel
++    def phase_build_system(self, f: qd.i32):
++        """Assemble the lumped diagonal and RHS of Eq. (7)."""
++        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
++            if self.particles_ng[f, i_p, i_b].active and self.particles_info[i_p].has_phase_field:
++                J_current = qd.max(self.particles[f, i_p, i_b].F.determinant(), 1.0e-8)
++                volume = self.particles_info[i_p].reference_volume * J_current
++                l0 = self.particles_info[i_p].phase_l0
++                residual = self.particles_info[i_p].phase_residual
++                history = self.particles_ng[f, i_p, i_b].phase_history
++                mobility = self.particles_info[i_p].phase_mobility
++                phase_factor = 1.0 + 4.0 * l0 * (1.0 - residual) * history * self.particles_info[
++                    i_p
++                ].phase_inv_toughness
++
++                base = qd.floor(self.particles[f, i_p, i_b].pos * self._inv_dx - 0.5).cast(gs.qd_int)
++                fx = self.particles[f, i_p, i_b].pos * self._inv_dx - base.cast(gs.qd_float)
++                w = [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1.0) ** 2, 0.5 * (fx - 0.5) ** 2]
++                for offset in qd.static(qd.grouped(self.stencil_range())):
++                    weight = gs.qd_float(1.0)
++                    for d in qd.static(range(3)):
++                        weight *= w[offset[d]][d]
++                    cell_ijk = base - self._grid_offset + offset
++
++                    rhs_coefficient = gs.qd_float(1.0)
++                    diagonal_coefficient = phase_factor
++                    if mobility > 0.0:
++                        rhs_coefficient = mobility + self.phase_grid[cell_ijk, i_b].old / self.substep_dt
++                        diagonal_coefficient = mobility * phase_factor + 1.0 / self.substep_dt
++                    qd.atomic_add(self.phase_grid[cell_ijk, i_b].rhs, volume * weight * rhs_coefficient)
++                    qd.atomic_add(self.phase_grid[cell_ijk, i_b].diag, volume * weight * diagonal_coefficient)
++
++    @qd.kernel
++    def phase_reset_cg_reductions(self):
++        for i_b, entry in qd.ndrange(self._B, 5):
++            self.phase_cg_reduce[i_b, entry] = 0.0
++
++    @qd.kernel
++    def phase_initialize_pcg(self):
++        for slot in range(self.grid_dirty_count[0]):
++            cell_ijk = self._phase_cell_ijk(self.grid_dirty_list[slot])
++            for i_b in range(self._B):
++                diag = self.phase_grid[cell_ijk, i_b].diag
++                rhs = self.phase_grid[cell_ijk, i_b].rhs
++                self.phase_grid[cell_ijk, i_b].x = 0.0
++                self.phase_grid[cell_ijk, i_b].Ap = 0.0
++                if diag > 1.0e-20:
++                    self.phase_grid[cell_ijk, i_b].r = rhs
++                    self.phase_grid[cell_ijk, i_b].z = rhs / diag
++                    self.phase_grid[cell_ijk, i_b].p = rhs / diag
++                    qd.atomic_add(self.phase_cg_reduce[i_b, 0], rhs * rhs / diag)
++                    qd.atomic_add(self.phase_cg_reduce[i_b, 3], rhs * rhs)
++                else:
++                    self.phase_grid[cell_ijk, i_b].r = 0.0
++                    self.phase_grid[cell_ijk, i_b].z = 0.0
++                    self.phase_grid[cell_ijk, i_b].p = 0.0
++
++    @qd.kernel
++    def phase_reset_iteration_reductions(self):
++        for i_b in range(self._B):
++            self.phase_cg_reduce[i_b, 1] = 0.0
++            self.phase_cg_reduce[i_b, 2] = 0.0
++            self.phase_cg_reduce[i_b, 4] = 0.0
++
++    @qd.kernel
++    def phase_set_Ap_diagonal(self):
++        for slot in range(self.grid_dirty_count[0]):
++            cell_ijk = self._phase_cell_ijk(self.grid_dirty_list[slot])
++            for i_b in range(self._B):
++                self.phase_grid[cell_ijk, i_b].Ap = (
++                    self.phase_grid[cell_ijk, i_b].diag * self.phase_grid[cell_ijk, i_b].p
++                )
++
++    @qd.kernel
++    def phase_compute_particle_gradient(self, f: qd.i32):
++        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
++            grad_phase = qd.Vector.zero(gs.qd_float, 3)
++            if self.particles_ng[f, i_p, i_b].active and self.particles_info[i_p].has_phase_field:
++                base = qd.floor(self.particles[f, i_p, i_b].pos * self._inv_dx - 0.5).cast(gs.qd_int)
++                fx = self.particles[f, i_p, i_b].pos * self._inv_dx - base.cast(gs.qd_float)
++                w = [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1.0) ** 2, 0.5 * (fx - 0.5) ** 2]
++                for offset in qd.static(qd.grouped(self.stencil_range())):
++                    dpos = offset.cast(gs.qd_float) - fx
++                    weight = gs.qd_float(1.0)
++                    for d in qd.static(range(3)):
++                        weight *= w[offset[d]][d]
++                    grad_weight = 4.0 * self._inv_dx * weight * dpos
++                    grad_phase += self.phase_grid[base - self._grid_offset + offset, i_b].p * grad_weight
++            self.phase_particle_grad[i_p, i_b] = grad_phase
++
++    @qd.kernel
++    def phase_scatter_stiffness(self, f: qd.i32):
++        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
++            if self.particles_ng[f, i_p, i_b].active and self.particles_info[i_p].has_phase_field:
++                J_current = qd.max(self.particles[f, i_p, i_b].F.determinant(), 1.0e-8)
++                volume = self.particles_info[i_p].reference_volume * J_current
++                l0 = self.particles_info[i_p].phase_l0
++                mobility = self.particles_info[i_p].phase_mobility
++                stiffness_scale = volume * 4.0 * l0 * l0
++                if mobility > 0.0:
++                    stiffness_scale *= mobility
++
++                base = qd.floor(self.particles[f, i_p, i_b].pos * self._inv_dx - 0.5).cast(gs.qd_int)
++                fx = self.particles[f, i_p, i_b].pos * self._inv_dx - base.cast(gs.qd_float)
++                w = [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1.0) ** 2, 0.5 * (fx - 0.5) ** 2]
++                for offset in qd.static(qd.grouped(self.stencil_range())):
++                    dpos = offset.cast(gs.qd_float) - fx
++                    weight = gs.qd_float(1.0)
++                    for d in qd.static(range(3)):
++                        weight *= w[offset[d]][d]
++                    grad_weight = 4.0 * self._inv_dx * weight * dpos
++                    qd.atomic_add(
++                        self.phase_grid[base - self._grid_offset + offset, i_b].Ap,
++                        stiffness_scale * self.phase_particle_grad[i_p, i_b].dot(grad_weight),
++                    )
++
++    @qd.kernel
++    def phase_dot_p_Ap(self):
++        for slot in range(self.grid_dirty_count[0]):
++            cell_ijk = self._phase_cell_ijk(self.grid_dirty_list[slot])
++            for i_b in range(self._B):
++                qd.atomic_add(
++                    self.phase_cg_reduce[i_b, 1],
++                    self.phase_grid[cell_ijk, i_b].p * self.phase_grid[cell_ijk, i_b].Ap,
++                )
++
++    @qd.kernel
++    def phase_update_x_r_z(self):
++        for slot in range(self.grid_dirty_count[0]):
++            cell_ijk = self._phase_cell_ijk(self.grid_dirty_list[slot])
++            for i_b in range(self._B):
++                rz = self.phase_cg_reduce[i_b, 0]
++                pAp = self.phase_cg_reduce[i_b, 1]
++                alpha = gs.qd_float(0.0)
++                if qd.abs(pAp) > 1.0e-30:
++                    alpha = rz / pAp
++                diag = self.phase_grid[cell_ijk, i_b].diag
++                if diag > 1.0e-20:
++                    self.phase_grid[cell_ijk, i_b].x += alpha * self.phase_grid[cell_ijk, i_b].p
++                    self.phase_grid[cell_ijk, i_b].r -= alpha * self.phase_grid[cell_ijk, i_b].Ap
++                    self.phase_grid[cell_ijk, i_b].z = self.phase_grid[cell_ijk, i_b].r / diag
++                    qd.atomic_add(
++                        self.phase_cg_reduce[i_b, 2],
++                        self.phase_grid[cell_ijk, i_b].r * self.phase_grid[cell_ijk, i_b].r,
++                    )
++                    qd.atomic_add(
++                        self.phase_cg_reduce[i_b, 4],
++                        self.phase_grid[cell_ijk, i_b].r * self.phase_grid[cell_ijk, i_b].z,
++                    )
++
++    @qd.kernel
++    def phase_update_direction(self):
++        for slot in range(self.grid_dirty_count[0]):
++            cell_ijk = self._phase_cell_ijk(self.grid_dirty_list[slot])
++            for i_b in range(self._B):
++                rz_old = self.phase_cg_reduce[i_b, 0]
++                beta = gs.qd_float(0.0)
++                if qd.abs(rz_old) > 1.0e-30:
++                    beta = self.phase_cg_reduce[i_b, 4] / rz_old
++                self.phase_grid[cell_ijk, i_b].p = (
++                    self.phase_grid[cell_ijk, i_b].z + beta * self.phase_grid[cell_ijk, i_b].p
++                )
++        for i_b in range(self._B):
++            self.phase_cg_reduce[i_b, 0] = self.phase_cg_reduce[i_b, 4]
++
++    @qd.kernel
++    def phase_g2p(self, f: qd.i32):
++        """FLIP phase transfer and irreversibility clamp."""
++        for i_p, i_b in qd.ndrange(self._n_particles, self._B):
++            if self.particles_ng[f, i_p, i_b].active:
++                old_phase = self.particles_ng[f, i_p, i_b].phase
++                old_history = self.particles_ng[f, i_p, i_b].phase_history
++                new_phase = old_phase
++                new_history = old_history
++                if self.particles_info[i_p].phase_enabled:
++                    base = qd.floor(self.particles[f, i_p, i_b].pos * self._inv_dx - 0.5).cast(gs.qd_int)
++                    fx = self.particles[f, i_p, i_b].pos * self._inv_dx - base.cast(gs.qd_float)
++                    w = [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1.0) ** 2, 0.5 * (fx - 0.5) ** 2]
++                    grid_solution = gs.qd_float(0.0)
++                    grid_old = gs.qd_float(0.0)
++                    for offset in qd.static(qd.grouped(self.stencil_range())):
++                        weight = gs.qd_float(1.0)
++                        for d in qd.static(range(3)):
++                            weight *= w[offset[d]][d]
++                        cell = self.phase_grid[base - self._grid_offset + offset, i_b]
++                        grid_solution += weight * cell.x
++                        grid_old += weight * cell.old
++
++                    candidate = grid_solution
++                    if self.particles_info[i_p].phase_mobility > 0.0:
++                        candidate = old_phase + grid_solution - grid_old
++                    new_phase = qd.max(0.0, qd.min(old_phase, candidate))
++
++                self.particles_ng[f + 1, i_p, i_b].phase = new_phase
++                self.particles_ng[f + 1, i_p, i_b].phase_history = new_history
++
++    def solve_phase_field(self, f):
++        """Solve one Ziran-style matrix-free PFF system with Jacobi-PCG."""
++        self.phase_update_history(f)
++        self.phase_p2g_old(f)
++        self.phase_normalize_old()
++        self.phase_build_system(f)
++        self.phase_reset_cg_reductions()
++        self.phase_initialize_pcg()
++
++        iterations = 0
++        for iteration in range(self._phase_cg_max_iterations):
++            self.phase_reset_iteration_reductions()
++            self.phase_set_Ap_diagonal()
++            self.phase_compute_particle_gradient(f)
++            self.phase_scatter_stiffness(f)
++            self.phase_dot_p_Ap()
++            self.phase_update_x_r_z()
++            iterations = iteration + 1
++
++            reductions = self.phase_cg_reduce.to_numpy()
++            residual_norm = np.sqrt(np.maximum(reductions[:, 2], 0.0))
++            rhs_norm = np.sqrt(np.maximum(reductions[:, 3], 0.0))
++            if np.all(residual_norm <= self._phase_cg_tolerance * np.maximum(rhs_norm, 1.0e-20)):
++                break
++            if np.any(np.abs(reductions[:, 1]) <= 1.0e-30):
++                break
++            self.phase_update_direction()
++
++        self._phase_last_cg_iterations = iterations
++        reductions = self.phase_cg_reduce.to_numpy()
++        residual_norm = np.sqrt(np.maximum(reductions[:, 2], 0.0))
++        rhs_norm = np.sqrt(np.maximum(reductions[:, 3], 0.0))
++        self._phase_last_cg_relative_residual = float(
++            np.max(residual_norm / np.maximum(rhs_norm, 1.0e-20), initial=0.0)
++        )
++        self.phase_g2p(f)
++
+     @qd.kernel
+     def g2p(
+         self,
+@@ -526,12 +869,21 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+                 self.particles[f + 1, i_p, i_b].vel = new_vel
+                 self.particles[f + 1, i_p, i_b].C = new_C
+                 self.particles[f + 1, i_p, i_b].pos = new_pos
++                if qd.static(not self._use_phase_field):
++                    self.particles_ng[f + 1, i_p, i_b].phase = self.particles_ng[f, i_p, i_b].phase
++                    self.particles_ng[f + 1, i_p, i_b].phase_history = self.particles_ng[
++                        f, i_p, i_b
++                    ].phase_history
+             else:
+                 self.particles[f + 1, i_p, i_b].vel = self.particles[f, i_p, i_b].vel
+                 self.particles[f + 1, i_p, i_b].pos = self.particles[f, i_p, i_b].pos
+                 self.particles[f + 1, i_p, i_b].C = self.particles[f, i_p, i_b].C
+                 self.particles[f + 1, i_p, i_b].F = self.particles[f, i_p, i_b].F
+                 self.particles[f + 1, i_p, i_b].Jp = self.particles[f, i_p, i_b].Jp
++                self.particles_ng[f + 1, i_p, i_b].phase = self.particles_ng[f, i_p, i_b].phase
++                self.particles_ng[f + 1, i_p, i_b].phase_history = self.particles_ng[
++                    f, i_p, i_b
++                ].phase_history
+ 
+             self.particles_ng[f + 1, i_p, i_b].active = self.particles_ng[f, i_p, i_b].active
+ 
+@@ -556,6 +908,11 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+             entity.process_input_grad()
+ 
+     def substep_pre_coupling(self, f):
++        # PFF-MPM uses the staggered order from Wolper et al. (2019): update
++        # H(F^n), solve c^(n+1), then evaluate this substep's stress with the
++        # new phase.  The phase P2G also seeds the shared sparse dirty list.
++        if self._use_phase_field:
++            self.solve_phase_field(f)
+         if self._sim.requires_grad:
+             self.reset_grid_and_grad(f)
+             # Keep F_tmp and svd as separate kernels so their backward passes (compute_F_tmp.grad and svd_grad) remain
+@@ -645,6 +1002,10 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+             self.particles[target, i_p, i_b].Jp = self.particles[source, i_p, i_b].Jp
+ 
+             self.particles_ng[target, i_p, i_b].active = self.particles_ng[source, i_p, i_b].active
++            self.particles_ng[target, i_p, i_b].phase = self.particles_ng[source, i_p, i_b].phase
++            self.particles_ng[target, i_p, i_b].phase_history = self.particles_ng[
++                source, i_p, i_b
++            ].phase_history
+ 
+     @qd.kernel
+     def copy_grad(self, source: qd.i32, target: qd.i32):
+@@ -683,6 +1044,16 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+                 self.grid[f, i, j, k, i_b].mass = gs.qd_float(0.0)
+                 self.grid[f, i, j, k, i_b].vel_in = qd.Vector.zero(gs.qd_float, 3)
+                 self.grid[f, i, j, k, i_b].vel_out = qd.Vector.zero(gs.qd_float, 3)
++                if qd.static(self._use_phase_field):
++                    self.phase_grid[i, j, k, i_b].weight = 0.0
++                    self.phase_grid[i, j, k, i_b].old = 0.0
++                    self.phase_grid[i, j, k, i_b].rhs = 0.0
++                    self.phase_grid[i, j, k, i_b].diag = 0.0
++                    self.phase_grid[i, j, k, i_b].x = 0.0
++                    self.phase_grid[i, j, k, i_b].r = 0.0
++                    self.phase_grid[i, j, k, i_b].z = 0.0
++                    self.phase_grid[i, j, k, i_b].p = 0.0
++                    self.phase_grid[i, j, k, i_b].Ap = 0.0
+                 if i_b == 0:
+                     self.grid_dirty_flag[i, j, k] = gs.qd_int(0)
+ 
+@@ -782,6 +1153,10 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+                 self._ckpt[ckpt_name]["C"] = torch.zeros((self._B, self._n_particles, 3, 3), dtype=gs.tc_float)
+                 self._ckpt[ckpt_name]["F"] = torch.zeros((self._B, self._n_particles, 3, 3), dtype=gs.tc_float)
+                 self._ckpt[ckpt_name]["Jp"] = torch.zeros((self._B, self._n_particles), dtype=gs.tc_float)
++                self._ckpt[ckpt_name]["phase"] = torch.ones((self._B, self._n_particles), dtype=gs.tc_float)
++                self._ckpt[ckpt_name]["phase_history"] = torch.zeros(
++                    (self._B, self._n_particles), dtype=gs.tc_float
++                )
+                 self._ckpt[ckpt_name]["active"] = torch.zeros((self._B, self._n_particles), dtype=gs.tc_bool)
+ 
+             self._kernel_get_state(
+@@ -791,6 +1166,8 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+                 self._ckpt[ckpt_name]["C"],
+                 self._ckpt[ckpt_name]["F"],
+                 self._ckpt[ckpt_name]["Jp"],
++                self._ckpt[ckpt_name]["phase"],
++                self._ckpt[ckpt_name]["phase_history"],
+                 self._ckpt[ckpt_name]["active"],
+             )
+ 
+@@ -814,6 +1191,8 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+                 self._ckpt[ckpt_name]["C"],
+                 self._ckpt[ckpt_name]["F"],
+                 self._ckpt[ckpt_name]["Jp"],
++                self._ckpt[ckpt_name]["phase"],
++                self._ckpt[ckpt_name]["phase_history"],
+                 self._ckpt[ckpt_name]["active"],
+             )
+ 
+@@ -822,7 +1201,17 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+ 
+     def set_state(self, f, state, envs_idx=None):
+         if self.is_active:
+-            self._kernel_set_state(f, state.pos, state.vel, state.C, state.F, state.Jp, state.active)
++            self._kernel_set_state(
++                f,
++                state.pos,
++                state.vel,
++                state.C,
++                state.F,
++                state.Jp,
++                state.phase,
++                state.phase_history,
++                state.active,
++            )
+ 
+     @qd.kernel
+     def _kernel_set_state(
+@@ -833,6 +1222,8 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+         C: qd.types.ndarray(),  # shape [B, n_particles, 3, 3]
+         F: qd.types.ndarray(),  # shape [B, n_particles, 3, 3]
+         Jp: qd.types.ndarray(),  # shape [B, n_particles]
++        phase: qd.types.ndarray(),  # shape [B, n_particles]
++        phase_history: qd.types.ndarray(),  # shape [B, n_particles]
+         active: qd.types.ndarray(),  # shape [B, n_particles]
+     ):
+         for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+@@ -846,6 +1237,8 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+                     self.particles[f, i_p, i_b].F[j, k] = F[i_b, i_p, j, k]
+             # Write Jp, active
+             self.particles[f, i_p, i_b].Jp = Jp[i_b, i_p]
++            self.particles_ng[f, i_p, i_b].phase = phase[i_b, i_p]
++            self.particles_ng[f, i_p, i_b].phase_history = phase_history[i_b, i_p]
+             self.particles_ng[f, i_p, i_b].active = active[i_b, i_p]
+ 
+     def get_state(self, f):
+@@ -853,7 +1246,17 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+             return None
+ 
+         state = MPMSolverState(self._scene)
+-        self._kernel_get_state(f, state.pos, state.vel, state.C, state.F, state.Jp, state.active)
++        self._kernel_get_state(
++            f,
++            state.pos,
++            state.vel,
++            state.C,
++            state.F,
++            state.Jp,
++            state.phase,
++            state.phase_history,
++            state.active,
++        )
+         return state
+ 
+     @qd.kernel
+@@ -865,6 +1268,8 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+         C: qd.types.ndarray(),  # shape [B, n_particles, 3, 3]
+         F: qd.types.ndarray(),  # shape [B, n_particles, 3, 3]
+         Jp: qd.types.ndarray(),  # shape [B, n_particles]
++        phase: qd.types.ndarray(),  # shape [B, n_particles]
++        phase_history: qd.types.ndarray(),  # shape [B, n_particles]
+         active: qd.types.ndarray(),  # shape [B, n_particles]
+     ):
+         for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+@@ -875,6 +1280,8 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+                     C[i_b, i_p, j, k] = self.particles[f, i_p, i_b].C[j, k]
+                     F[i_b, i_p, j, k] = self.particles[f, i_p, i_b].F[j, k]
+             Jp[i_b, i_p] = self.particles[f, i_p, i_b].Jp
++            phase[i_b, i_p] = self.particles_ng[f, i_p, i_b].phase
++            phase_history[i_b, i_p] = self.particles_ng[f, i_p, i_b].phase_history
+             active[i_b, i_p] = qd.cast(self.particles_ng[f, i_p, i_b].active, gs.qd_bool)
+ 
+     def update_render_fields(self):
+@@ -912,6 +1319,13 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+         material_idx: qd.i32,
+         mat_default_Jp: qd.f32,
+         mat_rho: qd.f32,
++        reference_volume: qd.f32,
++        has_phase_field: qd.i32,
++        phase_enabled: qd.i32,
++        phase_l0: qd.f32,
++        phase_inv_toughness: qd.f32,
++        phase_residual: qd.f32,
++        phase_mobility: qd.f32,
+         pos: qd.types.ndarray(),  # shape [n_particles, 3]
+     ):
+         for i_p_ in range(n_particles):
+@@ -919,8 +1333,15 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+ 
+             self.particles_info[i_p].material_idx = material_idx
+             self.particles_info[i_p].default_Jp = mat_default_Jp
+-            self.particles_info[i_p].mass = self._particle_volume * mat_rho
++            self.particles_info[i_p].reference_volume = reference_volume
++            self.particles_info[i_p].mass = reference_volume * mat_rho
+             self.particles_info[i_p].free = True
++            self.particles_info[i_p].has_phase_field = qd.cast(has_phase_field, gs.qd_bool)
++            self.particles_info[i_p].phase_enabled = qd.cast(phase_enabled, gs.qd_bool)
++            self.particles_info[i_p].phase_l0 = phase_l0
++            self.particles_info[i_p].phase_inv_toughness = phase_inv_toughness
++            self.particles_info[i_p].phase_residual = phase_residual
++            self.particles_info[i_p].phase_mobility = phase_mobility
+             self.particles_info[i_p].muscle_group = 0
+             self.particles_info[i_p].muscle_direction = qd.Vector([0.0, 0.0, 1.0], dt=gs.qd_float)
+ 
+@@ -936,6 +1357,8 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+             self.particles[f, i_p, i_b].C = qd.Matrix.zero(gs.qd_float, 3, 3)
+             self.particles[f, i_p, i_b].Jp = mat_default_Jp
+             self.particles[f, i_p, i_b].actu = gs.qd_float(0.0)
++            self.particles_ng[f, i_p, i_b].phase = gs.qd_float(1.0)
++            self.particles_ng[f, i_p, i_b].phase_history = gs.qd_float(0.0)
+ 
+     @qd.kernel
+     def _kernel_set_particles_pos(
+@@ -953,6 +1376,8 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+             self.particles[f, i_p, i_b].F = qd.Matrix.identity(gs.qd_float, 3)
+             self.particles[f, i_p, i_b].C.fill(0.0)
+             self.particles[f, i_p, i_b].Jp = self.particles_info[i_p].default_Jp
++            self.particles_ng[f, i_p, i_b].phase = gs.qd_float(1.0)
++            self.particles_ng[f, i_p, i_b].phase_history = gs.qd_float(0.0)
+ 
+     @qd.kernel
+     def _kernel_set_particles_pos_grad(
+@@ -1191,6 +1616,18 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+                 self.particle_constraints[i_p, i_b].is_constrained = False
+                 self.particle_constraints[i_p, i_b].link_idx = -1
+ 
++    @qd.kernel
++    def _kernel_set_particle_phase_damage_enabled(
++        self,
++        particles_mask: qd.types.ndarray(),
++        particle_start: qd.i32,
++        enabled: qd.i32,
++    ):
++        for i_p_local in range(particles_mask.shape[1]):
++            if particles_mask[0, i_p_local]:
++                i_p = i_p_local + particle_start
++                self.particles_info[i_p].phase_enabled = qd.cast(enabled, gs.qd_bool)
++
+     @qd.kernel
+     def apply_particle_constraints(self, f: qd.i32, links_state: array_class.LinksState):
+         for i_p, i_b in qd.ndrange(self._n_particles, self._B):
+@@ -1209,12 +1646,18 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+                 stiffness = self.particle_constraints[i_p, i_b].stiffness
+                 mass = self.particles_info[i_p].mass / self._particle_volume_scale
+ 
++                target_vel = qd.Vector.zero(gs.qd_float, 3)
++                if i_l >= 0:
++                    target_vel = links_state.cd_vel[i_l, i_b] + links_state.cd_ang[i_l, i_b].cross(
++                        target_pos - links_state.root_COM[i_l, i_b]
++                    )
++
+                 pos = self.particles[f + 1, i_p, i_b].pos
+                 vel = self.particles[f + 1, i_p, i_b].vel
+ 
+                 pos_error = pos - target_pos
+                 spring_force = -stiffness * pos_error
+-                damping_force = -2.0 * qd.math.sqrt(stiffness * mass) * vel
++                damping_force = -2.0 * qd.math.sqrt(stiffness * mass) * (vel - target_vel)
+ 
+                 dv = self.substep_dt * (spring_force + damping_force) / mass
+                 self.particles[f + 1, i_p, i_b].vel = vel + dv
+diff --git a/genesis/engine/states/entities.py b/genesis/engine/states/entities.py
+index 06f8e953..2674f4f5 100644
+--- a/genesis/engine/states/entities.py
++++ b/genesis/engine/states/entities.py
+@@ -57,6 +57,9 @@ class MPMEntityState(RBC):
+         self._C = gs.zeros(base_shape + (3, 3), **args)
+         self._F = gs.zeros(base_shape + (3, 3), **args)
+         self._Jp = gs.zeros(base_shape, **args)
++        args["requires_grad"] = False
++        self._phase = gs.ones(base_shape, **args)
++        self._phase_history = gs.zeros(base_shape, **args)
+ 
+         args["dtype"] = int
+         args["requires_grad"] = False
+@@ -70,6 +73,8 @@ class MPMEntityState(RBC):
+         self._C = self._C.detach()
+         self._F = self._F.detach()
+         self._Jp = self._Jp.detach()
++        self._phase = self._phase.detach()
++        self._phase_history = self._phase_history.detach()
+         self._active = self._active.detach()
+ 
+     @property
+@@ -100,6 +105,14 @@ class MPMEntityState(RBC):
+     def Jp(self):
+         return self._Jp
+ 
++    @property
++    def phase(self):
++        return self._phase
++
++    @property
++    def phase_history(self):
++        return self._phase_history
++
+     @property
+     def active(self):
+         return self._active
+diff --git a/genesis/engine/states/solvers.py b/genesis/engine/states/solvers.py
+index a0f2ed02..25e8e0c1 100644
+--- a/genesis/engine/states/solvers.py
++++ b/genesis/engine/states/solvers.py
+@@ -158,6 +158,9 @@ class MPMSolverState(RBC):
+         self._C = gs.zeros((scene.sim._B, scene.sim.mpm_solver.n_particles, 3, 3), **args)
+         self._F = gs.zeros((scene.sim._B, scene.sim.mpm_solver.n_particles, 3, 3), **args)
+         self._Jp = gs.zeros((scene.sim._B, scene.sim.mpm_solver.n_particles), **args)
++        args["requires_grad"] = False
++        self._phase = gs.ones((scene.sim._B, scene.sim.mpm_solver.n_particles), **args)
++        self._phase_history = gs.zeros((scene.sim._B, scene.sim.mpm_solver.n_particles), **args)
+         args["dtype"] = gs.tc_bool
+         args["requires_grad"] = False
+         self._active = gs.zeros((scene.sim._B, scene.sim.mpm_solver.n_particles), **args)
+@@ -170,6 +173,8 @@ class MPMSolverState(RBC):
+         self._C = self._C.detach()
+         self._F = self._F.detach()
+         self._Jp = self._Jp.detach()
++        self._phase = self._phase.detach()
++        self._phase_history = self._phase_history.detach()
+         self._active = self._active.detach()
+ 
+     @property
+@@ -196,6 +201,14 @@ class MPMSolverState(RBC):
+     def Jp(self):
+         return self._Jp
+ 
++    @property
++    def phase(self):
++        return self._phase
++
++    @property
++    def phase_history(self):
++        return self._phase_history
++
+     @property
+     def active(self):
+         return self._active

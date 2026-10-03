@@ -4,7 +4,8 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'genesis-world'))
+from genesis_runtime import activate
+activate()
 import genesis as gs
 
 gs.init(backend=gs.cpu, logging_level='warning')

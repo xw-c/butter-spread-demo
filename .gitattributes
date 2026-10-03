@@ -1,0 +1,3 @@
+# Bootstrap verifies these exact patch bytes, including on Windows checkouts.
+# A unified diff's blank context line contains a required leading space.
+*.patch text eol=lf whitespace=-blank-at-eol

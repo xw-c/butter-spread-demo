@@ -1,0 +1,7 @@
+# Separate from Genesis: Isaac 5.1 requires its own compatible NumPy/Numba.
+numpy==1.26.0
+scipy==1.15.3
+numba==0.59.1
+matplotlib==3.10.3
+imageio-ffmpeg==0.6.0
+Pillow==11.3.0

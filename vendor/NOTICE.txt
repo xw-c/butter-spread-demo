@@ -1,0 +1,18 @@
+Genesis engine source: https://github.com/Genesis-Embodied-AI/genesis-world
+Pinned upstream commit: 7cd75da686864bb229efebf19d9c689ce198ea57
+License: Apache-2.0; see GENESIS-LICENSE.
+
+genesis-mpm.patch preserves the engine changes in the calibrated local engine,
+including per-material MPM reference volume and the existing optional phase-field
+and NACC extensions (these optional models are not enabled by the butter demo).
+It is applied to the public upstream commit, not to a private or sibling clone.
+The archive, patch and patched files are checked against genesis-lock.json.
+
+physics/cream_materials.py and physics/cream_contact.py were moved verbatim from
+the calibrated cream example at local source commit
+9a4ab7a3820781df7aea39fd0376e4acc07a3c4f plus its working contact corrections.
+All required custom source is now part of this repository. The JSON bread
+defaults preserve that example's calibration for the regression test.
+
+CD-MPM bread source and its MIT license are in assets/reference/cdmpm/.
+Isaac Sim is installed separately under NVIDIA's license, not redistributed here.

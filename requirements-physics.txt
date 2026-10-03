@@ -1,0 +1,38 @@
+# Python 3.11. Direct engine and demo dependencies pinned to the calibrated environment.
+# CUDA-enabled torch is installed separately by setup_demo.py.
+av==18.0.0
+coacd==1.0.11
+DracoPy==2.0.0
+fast_simplification==0.1.13
+freetype-py==2.5.1
+frozendict==2.4.7
+gs-madrona==0.0.10; platform_system == "Linux" and (platform_machine == "x86_64" or platform_machine == "AMD64")
+imageio-ffmpeg==0.6.0
+libigl==2.6.1
+matplotlib==3.11.0
+moviepy==2.2.1
+mujoco==3.6.0
+numba==0.66.0
+numpy==2.4.6
+opencv-python==5.0.0.93
+OpenEXR==3.4.13
+Pillow==11.3.0
+psutil==7.2.2
+py-cpuinfo==9.0.0
+pycollada==0.9.3
+pydantic==2.13.4
+PyGEL3D==0.6.1
+pyglet==2.1.15
+pygltflib==1.16.0
+pymeshlab==2025.7.post1
+PyOpenGL==3.1.10
+pysplashsurf==0.14.1.0
+quadrants==1.3.0
+rtree==1.4.1
+scikit-image==0.26.0
+scipy==1.17.1
+tetgen==0.8.2
+trimesh==4.12.2
+vtk==9.6.2
+xacro==2.1.1
+z3-solver==4.15.4.0

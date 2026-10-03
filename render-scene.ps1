@@ -2,14 +2,15 @@ param(
     [ValidateRange(1,256)][int]$Samples = 64,
     [ValidateRange(320,3840)][int]$Width = 1280,
     [ValidateRange(240,2160)][int]$Height = 720,
-    [string]$Output = (Join-Path $PSScriptRoot 'outputs\butter-spread.mp4')
+    [string]$PhysicsPython = $env:BUTTER_PHYSICS_PYTHON,
+    [string]$IsaacPython = $env:BUTTER_ISAAC_PYTHON,
+    [string]$Output = (Join-Path $PSScriptRoot 'outputs/butter-spread.mp4')
 )
 $ErrorActionPreference = 'Stop'
-$root = $PSScriptRoot
-$repo = Split-Path -Parent $root
-$python = Join-Path $repo 'lw-runtime\python.exe'
-& $python (Join-Path $root 'scripts\render_isaac.py') --samples $Samples --width $Width --height $Height --output $Output
-if ($LASTEXITCODE -ne 0) { throw 'Reference-scene render failed' }
-& $python (Join-Path $root 'scripts\verify_video.py') --video $Output
-if ($LASTEXITCODE -ne 0) { throw 'Video validation failed' }
-Write-Output $Output
+if (-not $PhysicsPython) { $PhysicsPython = Join-Path $PSScriptRoot '.venv-physics/Scripts/python.exe' }
+if (-not (Test-Path -LiteralPath $PhysicsPython)) { throw 'Physics Python missing. Run setup-demo.ps1 or pass -PhysicsPython.' }
+$arguments = @((Join-Path $PSScriptRoot 'scripts/run_demo.py'), '--render-only',
+    '--samples', $Samples, '--width', $Width, '--height', $Height, '--output', $Output)
+if ($IsaacPython) { $arguments += @('--isaac-python', $IsaacPython) }
+& $PhysicsPython @arguments
+if ($LASTEXITCODE -ne 0) { throw 'Scene render or validation failed.' }
